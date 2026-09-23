@@ -135,18 +135,23 @@ Expected output:
 ### Standard Verification Run (GLM-5.3-Flash-UD-IQ2_XXS)
 ```bash
 GGML_CUDA_DISABLE_GRAPHS=1 \
-NVMOE_CACHE_SIZE=20 \
-NVMOE_GPU_PINNED_EXPERTS=10 \
-NVMOE_HOST_CACHE_SIZE=48 \
-NVMOE_PINNED_EXPERTS=32 \
-NVMOE_PRUNE_NVME_THRESH=0.10 \
-NVMOE_PRUNE_MIN_KEEP=4 \
+NVMOE_CACHE_SIZE=24 \
+NVMOE_GPU_PINNED_EXPERTS=6 \
+NVMOE_HOST_CACHE_SIZE=56 \
+NVMOE_PINNED_EXPERTS=8 \
+NVMOE_PRUNE_NVME_THRESH=0.18 \
+NVMOE_PRUNE_MIN_KEEP=3 \
+NVMOE_PRUNE_MIN_MASS=0.75 \
 NVMOE_FREQ_PATH=models/freq_glm53.bin \
 ./moe_cache_probe \
   -m models/glm-5.3-flash-iq2xxs/UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf \
-  -c 2048 \
-  --server --port 8080
+  -p "The capital of France is" \
+  -c 512 -n 50 --temp 0
 ```
+Expected output:
+- Target decode throughput: **> 5.0 tok/s** (steady-state ~5.5 tok/s, min latency < 100 ms).
+- Pruned NVMe tail reads: **> 4,000 skipped per 50 tokens**.
+- Output text: Coherent generation describing Paris and France.
 
 ### Running the Benchmark Suite (`nvmoe-bench`)
 ```bash

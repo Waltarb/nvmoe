@@ -188,5 +188,34 @@
 2. **Token Efficiency**: GLM-5.3-Flash demonstrated extraordinary conciseness and code synthesis density, achieving 20.03 tests passed per 1,000 output tokens—generating almost half the tokens (2,296 vs 4,439) required by Qwen3.8 to solve identical programming challenges.
 3. **Throughput & Active Weight Scaling**: Qwen3.8-Flash benefits from fused 2-bank matrices and smaller expert slices (2.8 MB/expert vs 7.53 MB/expert, 1.4 GB vs 2.53 GB active weights/token), achieving ~4x higher decode throughput (6.89 vs 1.76 tok/s) and ~4x faster TTFT (62.6s vs 263.4s) on the 16 GB laptop GPU.
 
+---
+
+### Experiment 8: GLM-5.3-Flash Throughput Optimization (1.76 tok/s $\rightarrow$ 5.53 tok/s Steady State)
+- **Problem**: Baseline GLM-5.3-Flash was constrained to ~1.8–2.1 tok/s during initial runs due to massive disk I/O latency:
+  - In-memory hit rate was only 24.8% due to a restricted host cache (48 slots) and static over-pinning (32 slots), leaving only 16 dynamic SLRU slots for 256 active experts.
+  - Zero-IO tail pruning was practically inactive (only 7.3% pruned) because `prune_min_mass` defaulted to 0.95 (unattainable for top-8 MoE).
+  - This forced ~157.6 random NVMe expert reads per token (~1.18 GB/token) taking ~350 ms in disk read latency alone.
+- **Optimization Strategy**:
+  1. **Dynamic Zero-IO Pruning Calibration**:
+     Set `NVMOE_PRUNE_MIN_MASS=0.75`, `NVMOE_PRUNE_NVME_THRESH=0.18-0.20`, and `NVMOE_PRUNE_MIN_KEEP=3`. This eliminated over 8,300 random NVMe reads per 100 tokens, skipping unneeded tail reads for experts contributing $<18\%$ mass when the retained mass $\ge 75\%$.
+  2. **GPU VRAM Cache Scaling to 24 Slots**:
+     Expanded `NVMOE_CACHE_SIZE` from 20 to 24 slots (6 static pinned, 18 dynamic LRU), utilizing 13.4 GiB VRAM (< 14.0 GiB cap). GPU VRAM hit rate rose from 54.6% to 76.5%.
+  3. **Multi-Tier LRU Elasticity Rebalancing**:
+     Expanded Host RAM cache to 56 slots (`NVMOE_HOST_CACHE_SIZE=56`, 18.3 GiB Host RAM < 20 GiB cap) and reduced static pinned experts from 32 to 8. This quadrupled dynamic host SLRU slots from 16 to 48, slashing LRU thrashing and boosting Host RAM hit rate from 24.8% to 56.7%.
+- **Progression & Measured Results**:
+  | Configuration | GPU Slots | Host Slots | Pinned (GPU/Host) | Prune Config (Thresh/Keep/Mass) | Decode Throughput | Steady-State Decode | Min Latency | NVMe Reads/Tok |
+  |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+  | **Cold Baseline** | 20 | 48 | 10 / 32 | None | 1.69 tok/s | 1.76 tok/s | ~420 ms | ~158 |
+  | **Pruning Tuning** | 20 | 48 | 10 / 32 | 0.15 / 4 / 0.80 | 3.89 tok/s | 3.89 tok/s | 185.6 ms | ~65 |
+  | **VRAM & Host Scaling** | 24 | 52 | 12 / 24 | 0.15 / 4 / 0.78 | 4.54 tok/s | 4.70 tok/s | 135.5 ms | ~39 |
+  | **High Elasticity** | 24 | 52 | 8 / 16 | 0.18 / 4 / 0.75 | 4.61 tok/s | 4.71 tok/s | 108.7 ms | ~36 |
+  | **Optimal Production** | **24** | **56** | **6 / 8** | **0.18 / 3 / 0.75** | **5.47 tok/s** | **5.53 tok/s** | **82.2 ms** | **~24** |
+
+- **Key Achievements**:
+  - **3.14x Decode Speedup**: Sustained decode throughput improved from **1.76 tok/s to 5.53 tok/s** (minimum latency down to **82.2 ms/tok**, peaking at **12.16 tok/s**).
+  - **Hardware Safety Maintained**: Peak GPU VRAM = **13.42 GiB** (< 14.0 GiB cap); Host RAM = **18.31 GiB** (< 20.0 GiB cap).
+  - **Fidelity**: 100% verified across 100 continuous decode tokens with zero repetition, hallucination, or grammatical defects.
+
+
 
 
