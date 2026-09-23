@@ -1,0 +1,34 @@
+# Large Model weights
+models/*.gguf
+models/*.ftw
+models/*.bin
+!models/freq_qwen38.bin
+
+# Binaries and compiled targets
+moe_cache_probe
+test_sched_chain_shrink
+scripts/repack_nvfp4_gguf
+repack_nvfp4_gguf
+*.o
+*.so
+*.a
+*.dylib
+
+# Build directories
+build/
+llama.cpp/build/
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+env/
+
+# Editor / OS metadata
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
