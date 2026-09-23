@@ -813,6 +813,10 @@ static bool describe_bank(struct gguf_context * gctx, struct ggml_context * meta
     }
     out.base_offset = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid);
     out.row_bytes   = t->nb[2];
+    if (il == 0 && getenv("NVMOE_DEBUG_LAYER0")) {
+        fprintf(stderr, "[alignment] %s base_offset=%zu (%%4096=%zu) row_bytes=%zu (%%4096=%zu)\n",
+                name, out.base_offset, out.base_offset % 4096, out.row_bytes, out.row_bytes % 4096);
+    }
     return true;
 }
 
