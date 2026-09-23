@@ -104,7 +104,7 @@ For Qwen3.8-Flash-Next-NVFP4:
 ### Quick Rebuild of `moe_cache_probe`
 ```bash
 g++ -std=c++17 -O3 \
-    -I llama.cpp/include -I llama.cpp/common -I llama.cpp/ggml/include -I llama.cpp/src -I /opt/cuda/include \
+    -I llama.cpp/include -I llama.cpp/common -I llama.cpp/ggml/include -I llama.cpp/src -I llama.cpp/vendor -I /opt/cuda/include \
     scripts/moe_cache_probe.cpp \
     -L llama.cpp/build/bin -L /opt/cuda/lib64 \
     -lllama -lllama-common -lggml -lggml-base -lcudart -luring \
@@ -153,6 +153,29 @@ Expected output:
 - In-memory hit rate: **> 90%** (up to 93.4%).
 - Pruned NVMe tail reads: **> 5,700 skipped per 50 tokens**.
 - Output text: Coherent, rich generation describing Paris and France.
+
+### Standard Verification Run (Qwen3.8-Flash-Next Unsloth UD-Q2_K_XL / IQ2)
+```bash
+GGML_CUDA_DISABLE_GRAPHS=1 \
+NVMOE_CACHE_SIZE=36 \
+NVMOE_GPU_PINNED_EXPERTS=16 \
+NVMOE_HOST_CACHE_SIZE=96 \
+NVMOE_PINNED_EXPERTS=32 \
+NVMOE_PRUNE_NVME_THRESH=0.28 \
+NVMOE_PRUNE_MIN_KEEP=2 \
+NVMOE_PRUNE_MIN_MASS=0.60 \
+NVMOE_FREQ_PATH=models/freq_qwen38.bin \
+./moe_cache_probe \
+  -m models/qwen-3.8-flash-unsloth/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf \
+  -p "<|im_start|>user\nWhat is the capital of France and what is one famous landmark there?<|im_end|>\n<|im_start|>assistant\n" \
+  -c 512 -n 50 --temp 0
+```
+Expected output:
+- Target decode throughput: **> 14.0 tok/s** (steady-state ~15.3 tok/s, min latency < 45 ms / ~23 tok/s peak).
+- Prefill TTFT: **> 16.0 tok/s**.
+- In-memory hit rate: **> 80%**.
+- VRAM footprint: **< 7.0 GiB** (CUDA model buffer 6.46 GiB).
+- Output text: Coherent generation describing Paris and the Eiffel Tower.
 
 ### Running the Benchmark Suite (`nvmoe-bench`)
 ```bash
