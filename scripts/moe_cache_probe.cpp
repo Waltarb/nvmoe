@@ -439,81 +439,48 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
-    // Step 1: Batch-resolve host-tier residency with io_uring
-    std::vector<int32_t> host_miss_ids;
-    std::vector<int32_t> host_miss_slots;
-
-    for (int32_t real_id : unique_ids) {
-        lc.access_count[real_id]++;
-        int32_t h_slot = lc.host_slot_of_real[real_id];
-        if (h_slot != -1) {
-            st->host_hits++;
-            if (st->is_decode_phase) st->decode_host_hits++;
-            lc.host_lru.touch(real_id);
-        } else {
-            st->host_misses++;
-            if (st->is_decode_phase) st->decode_host_misses++;
-            int32_t new_slot = -1;
-            if (lc.host_next_free < lc.host_cache_size) {
-                new_slot = lc.host_next_free++;
-            } else {
-                auto not_in_active = [&](int32_t id) {
-                    return std::find(unique_ids.begin(), unique_ids.end(), id) == unique_ids.end();
-                };
-                int32_t victim_real = lc.host_lru.pop_lru_matching(not_in_active);
-                new_slot = lc.host_slot_of_real[victim_real];
-                lc.host_slot_of_real[victim_real] = -1;
-                lc.host_real_in_slot[new_slot] = -1;
-            }
-            lc.host_real_in_slot[new_slot] = real_id;
-            lc.host_slot_of_real[real_id] = new_slot;
-            lc.host_lru.insert_new(real_id);
-
-            host_miss_ids.push_back(real_id);
-            host_miss_slots.push_back(new_slot);
-        }
-    }
-
-    if (!host_miss_ids.empty()) {
-        std::vector<read_job> jobs;
-        if (lc.fused_gate_up) {
-            jobs.reserve(host_miss_ids.size() * 2);
-            for (size_t i = 0; i < host_miss_ids.size(); i++) {
-                int32_t real_id = host_miss_ids[i];
-                int32_t h_slot = host_miss_slots[i];
-                jobs.push_back({ lc.gate_up.base_offset + (size_t) real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(h_slot) });
-                jobs.push_back({ lc.down.base_offset    + (size_t) real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(h_slot) });
-            }
-        } else {
-            jobs.reserve(host_miss_ids.size() * 3);
-            for (size_t i = 0; i < host_miss_ids.size(); i++) {
-                int32_t real_id = host_miss_ids[i];
-                int32_t h_slot = host_miss_slots[i];
-                jobs.push_back({ lc.gate.base_offset + (size_t) real_id * lc.gate.row_bytes, lc.gate.row_bytes, lc.host_gate.slot_ptr(h_slot) });
-                jobs.push_back({ lc.up.base_offset   + (size_t) real_id * lc.up.row_bytes,   lc.up.row_bytes,   lc.host_up.slot_ptr(h_slot)   });
-                jobs.push_back({ lc.down.base_offset + (size_t) real_id * lc.down.row_bytes, lc.down.row_bytes, lc.host_down.slot_ptr(h_slot) });
-            }
-        }
-        if (!read_jobs_batch(*st, jobs)) {
-            fprintf(stderr, "[cache] FATAL: read_jobs_batch failed\n");
-            abort();
-        }
-    }
-
-    // Step 2: Ensure GPU residency and batch H2D copies asynchronously (GPU LRU)
+    // --- Step 1: Analyze GPU and Host residency for all unique active experts ---
     lc.current_step++;
     bool any_gpu_fill = false;
+
+    struct host_hit_item {
+        int32_t real_id;
+        int32_t gpu_slot;
+        int32_t host_slot;
+    };
+    std::vector<host_hit_item> host_hits_to_transfer;
+
+    struct nvme_expert_task {
+        int32_t real_id;
+        int32_t gpu_slot;
+        int32_t host_slot;
+        int completed_banks;
+        int total_banks;
+    };
+    std::vector<nvme_expert_task> nvme_tasks;
+    nvme_tasks.reserve(unique_ids.size());
+
+    std::vector<int32_t> gpu_miss_ids;
+
     for (int32_t real_id : unique_ids) {
         int32_t slot = lc.slot_of_real[real_id];
         if (slot != -1) {
             st->hits++;
             if (st->is_decode_phase) st->decode_hits++;
             lc.slot_last_used[slot] = lc.current_step;
-            continue;
+            lc.access_count[real_id]++;
+            if (lc.host_slot_of_real[real_id] != -1) {
+                lc.host_lru.touch(real_id);
+            }
+        } else {
+            st->misses++;
+            if (st->is_decode_phase) st->decode_misses++;
+            gpu_miss_ids.push_back(real_id);
         }
-        st->misses++;
-        if (st->is_decode_phase) st->decode_misses++;
+    }
 
+    // Allocate GPU slots for GPU misses and identify Host Hit vs NVMe Miss
+    for (int32_t real_id : gpu_miss_ids) {
         int chosen_slot = -1;
         uint32_t oldest_step = UINT32_MAX;
         int start_slot = (st->is_decode_phase && lc.gpu_pinned_k > 0) ? lc.gpu_pinned_k : 0;
@@ -550,35 +517,172 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                     unique_ids.size(), (long long) lc.cache_size);
             abort();
         }
-        slot = chosen_slot;
+        int32_t slot = chosen_slot;
         lc.slot_last_used[slot] = lc.current_step;
 
         int32_t evicted_real = lc.real_in_slot[slot];
         if (evicted_real != -1) {
             lc.slot_of_real[evicted_real] = -1;
         }
-
-        int32_t host_slot = lc.host_slot_of_real[real_id];
-        if (lc.fused_gate_up) {
-            gpu_fill_from_host_async(*st, lc, lc.gate_up, lc.host_gate_up, slot, host_slot, real_id);
-            gpu_fill_from_host_async(*st, lc, lc.down,    lc.host_down,    slot, host_slot, real_id);
-            if (lc.gate_up_scale.gpu_tensor && !lc.host_gate_up_scale.empty()) {
-                cudaMemcpyAsync((char *) lc.gate_up_scale.gpu_tensor->data + (size_t) slot * sizeof(float),
-                                &lc.host_gate_up_scale[real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
-            }
-            if (lc.down_scale.gpu_tensor && !lc.host_down_scale.empty()) {
-                cudaMemcpyAsync((char *) lc.down_scale.gpu_tensor->data + (size_t) slot * sizeof(float),
-                                &lc.host_down_scale[real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
-            }
-        } else {
-            gpu_fill_from_host_async(*st, lc, lc.gate, lc.host_gate, slot, host_slot, real_id);
-            gpu_fill_from_host_async(*st, lc, lc.up,   lc.host_up,   slot, host_slot, real_id);
-            gpu_fill_from_host_async(*st, lc, lc.down, lc.host_down, slot, host_slot, real_id);
-        }
-        any_gpu_fill = true;
-
         lc.real_in_slot[slot] = real_id;
         lc.slot_of_real[real_id] = slot;
+
+        // Check host tier residency
+        lc.access_count[real_id]++;
+        int32_t h_slot = lc.host_slot_of_real[real_id];
+        if (h_slot != -1) {
+            st->host_hits++;
+            if (st->is_decode_phase) st->decode_host_hits++;
+            lc.host_lru.touch(real_id);
+            host_hits_to_transfer.push_back({ real_id, slot, h_slot });
+        } else {
+            st->host_misses++;
+            if (st->is_decode_phase) st->decode_host_misses++;
+            int32_t new_slot = -1;
+            if (lc.host_next_free < lc.host_cache_size) {
+                new_slot = lc.host_next_free++;
+            } else {
+                auto not_in_active = [&](int32_t id) {
+                    return std::find(unique_ids.begin(), unique_ids.end(), id) == unique_ids.end();
+                };
+                int32_t victim_real = lc.host_lru.pop_lru_matching(not_in_active);
+                new_slot = lc.host_slot_of_real[victim_real];
+                lc.host_slot_of_real[victim_real] = -1;
+                lc.host_real_in_slot[new_slot] = -1;
+            }
+            lc.host_real_in_slot[new_slot] = real_id;
+            lc.host_slot_of_real[real_id] = new_slot;
+            lc.host_lru.insert_new(real_id);
+
+            nvme_tasks.push_back({ real_id, slot, new_slot, 0, lc.fused_gate_up ? 2 : 3 });
+        }
+    }
+
+    // --- Step 2: Immediately dispatch H2D transfers for Host Hits on dedicated stream ---
+    // (This streams over PCIe concurrently with disk reads below!)
+    for (const auto & hit : host_hits_to_transfer) {
+        if (lc.fused_gate_up) {
+            gpu_fill_from_host_async(*st, lc, lc.gate_up, lc.host_gate_up, hit.gpu_slot, hit.host_slot, hit.real_id);
+            gpu_fill_from_host_async(*st, lc, lc.down,    lc.host_down,    hit.gpu_slot, hit.host_slot, hit.real_id);
+            if (lc.gate_up_scale.gpu_tensor && !lc.host_gate_up_scale.empty()) {
+                cudaMemcpyAsync((char *) lc.gate_up_scale.gpu_tensor->data + (size_t) hit.gpu_slot * sizeof(float),
+                                &lc.host_gate_up_scale[hit.real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
+            }
+            if (lc.down_scale.gpu_tensor && !lc.host_down_scale.empty()) {
+                cudaMemcpyAsync((char *) lc.down_scale.gpu_tensor->data + (size_t) hit.gpu_slot * sizeof(float),
+                                &lc.host_down_scale[hit.real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
+            }
+        } else {
+            gpu_fill_from_host_async(*st, lc, lc.gate, lc.host_gate, hit.gpu_slot, hit.host_slot, hit.real_id);
+            gpu_fill_from_host_async(*st, lc, lc.up,   lc.host_up,   hit.gpu_slot, hit.host_slot, hit.real_id);
+            gpu_fill_from_host_async(*st, lc, lc.down, lc.host_down, hit.gpu_slot, hit.host_slot, hit.real_id);
+        }
+        any_gpu_fill = true;
+    }
+
+    // --- Step 3: Pipelined NVMe reads + instant H2D dispatch per completed expert ---
+    if (!nvme_tasks.empty()) {
+        struct nvme_subjob {
+            size_t offset;
+            size_t len;
+            uint8_t * out;
+            size_t staging_idx;
+            nvme_expert_task * task;
+        };
+        std::vector<nvme_subjob> subjobs;
+        subjobs.reserve(nvme_tasks.size() * (lc.fused_gate_up ? 2 : 3));
+
+        for (auto & t : nvme_tasks) {
+            if (lc.fused_gate_up) {
+                subjobs.push_back({ lc.gate_up.base_offset + (size_t) t.real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(t.host_slot), 0, &t });
+                subjobs.push_back({ lc.down.base_offset    + (size_t) t.real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(t.host_slot),    0, &t });
+            } else {
+                subjobs.push_back({ lc.gate.base_offset + (size_t) t.real_id * lc.gate.row_bytes, lc.gate.row_bytes, lc.host_gate.slot_ptr(t.host_slot), 0, &t });
+                subjobs.push_back({ lc.up.base_offset   + (size_t) t.real_id * lc.up.row_bytes,   lc.up.row_bytes,   lc.host_up.slot_ptr(t.host_slot),   0, &t });
+                subjobs.push_back({ lc.down.base_offset + (size_t) t.real_id * lc.down.row_bytes, lc.down.row_bytes, lc.host_down.slot_ptr(t.host_slot), 0, &t });
+            }
+        }
+
+        auto dispatch_expert_to_gpu = [&](nvme_expert_task * t) {
+            if (lc.fused_gate_up) {
+                gpu_fill_from_host_async(*st, lc, lc.gate_up, lc.host_gate_up, t->gpu_slot, t->host_slot, t->real_id);
+                gpu_fill_from_host_async(*st, lc, lc.down,    lc.host_down,    t->gpu_slot, t->host_slot, t->real_id);
+                if (lc.gate_up_scale.gpu_tensor && !lc.host_gate_up_scale.empty()) {
+                    cudaMemcpyAsync((char *) lc.gate_up_scale.gpu_tensor->data + (size_t) t->gpu_slot * sizeof(float),
+                                    &lc.host_gate_up_scale[t->real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
+                }
+                if (lc.down_scale.gpu_tensor && !lc.host_down_scale.empty()) {
+                    cudaMemcpyAsync((char *) lc.down_scale.gpu_tensor->data + (size_t) t->gpu_slot * sizeof(float),
+                                    &lc.host_down_scale[t->real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
+                }
+            } else {
+                gpu_fill_from_host_async(*st, lc, lc.gate, lc.host_gate, t->gpu_slot, t->host_slot, t->real_id);
+                gpu_fill_from_host_async(*st, lc, lc.up,   lc.host_up,   t->gpu_slot, t->host_slot, t->real_id);
+                gpu_fill_from_host_async(*st, lc, lc.down, lc.host_down, t->gpu_slot, t->host_slot, t->real_id);
+            }
+            any_gpu_fill = true;
+        };
+
+        if (!st->uring.initialized) {
+            for (auto & sj : subjobs) {
+                if (!read_odirect(st->fd_direct, sj.offset, sj.len, sj.out)) {
+                    fprintf(stderr, "[cache] FATAL: read_odirect failed\n");
+                    abort();
+                }
+                sj.task->completed_banks++;
+                if (sj.task->completed_banks == sj.task->total_banks) {
+                    dispatch_expert_to_gpu(sj.task);
+                }
+            }
+        } else {
+            size_t total = subjobs.size();
+            for (size_t start = 0; start < total; start += st->uring.max_batch) {
+                size_t batch_size = std::min(total - start, st->uring.max_batch);
+                for (size_t i = 0; i < batch_size; i++) {
+                    auto & sj = subjobs[start + i];
+                    sj.staging_idx = i;
+                    size_t aligned_off = align_down(sj.offset);
+                    size_t front_pad   = sj.offset - aligned_off;
+                    size_t aligned_len  = align_up(front_pad + sj.len);
+
+                    io_uring_sqe * sqe = io_uring_get_sqe(&st->uring.ring);
+                    io_uring_prep_read(sqe, st->fd_direct, st->uring.staging_buffers[i], aligned_len, aligned_off);
+                    io_uring_sqe_set_data64(sqe, (uint64_t)&sj);
+                }
+
+                int ret = io_uring_submit(&st->uring.ring);
+                if (ret < 0) {
+                    fprintf(stderr, "[cache] FATAL: io_uring_submit failed: %d\n", ret);
+                    abort();
+                }
+
+                size_t completed = 0;
+                while (completed < batch_size) {
+                    io_uring_cqe * cqe = nullptr;
+                    int wret = io_uring_wait_cqe(&st->uring.ring, &cqe);
+                    if (wret < 0 || !cqe) {
+                        fprintf(stderr, "[cache] FATAL: io_uring_wait_cqe failed: %d\n", wret);
+                        abort();
+                    }
+                    auto * sj = (nvme_subjob *) io_uring_cqe_get_data64(cqe);
+                    int res = cqe->res;
+                    io_uring_cqe_seen(&st->uring.ring, cqe);
+                    completed++;
+
+                    size_t aligned_off = align_down(sj->offset);
+                    size_t front_pad   = sj->offset - aligned_off;
+                    if (res < 0 || (size_t) res < front_pad + sj->len) {
+                        fprintf(stderr, "[cache] FATAL: read error in io_uring: res=%d, expected=%zu\n", res, front_pad + sj->len);
+                        abort();
+                    }
+                    memcpy(sj->out, st->uring.staging_buffers[sj->staging_idx] + front_pad, sj->len);
+                    sj->task->completed_banks++;
+                    if (sj->task->completed_banks == sj->task->total_banks) {
+                        dispatch_expert_to_gpu(sj->task);
+                    }
+                }
+            }
+        }
     }
 
     // Remap real IDs to GPU slot IDs
@@ -1088,6 +1192,8 @@ int main(int argc, char ** argv) {
     }
 
     auto t_decode_start = std::chrono::steady_clock::now();
+    auto t_last_token = t_decode_start;
+    std::vector<double> token_times;
 
     while (n_decoded < params.n_predict) {
         if (llama_decode(ctx, batch) != 0) {
@@ -1140,6 +1246,9 @@ int main(int argc, char ** argv) {
         }
         out_text += piece;
         n_decoded++;
+        auto t_cur_token = std::chrono::steady_clock::now();
+        token_times.push_back(std::chrono::duration<double>(t_cur_token - t_last_token).count());
+        t_last_token = t_cur_token;
         batch = llama_batch_get_one(&next_token, 1);
     }
 
@@ -1162,6 +1271,21 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "TTFT (Prefill):       %.3f s (%.2f tok/s)\n", ttft, tokens.size() / (ttft > 0 ? ttft : 1.0));
     fprintf(stderr, "Decode Time:          %.3f s\n", decode_secs);
     fprintf(stderr, "Decode Throughput:    %.2f tok/s\n", decode_tok_per_sec);
+    if (token_times.size() > 5) {
+        double steady_sum = 0.0;
+        double min_ms = 1e9, max_ms = 0.0;
+        size_t steady_count = token_times.size() - 5;
+        for (size_t i = 5; i < token_times.size(); i++) {
+            double ms = token_times[i] * 1000.0;
+            steady_sum += ms;
+            min_ms = std::min(min_ms, ms);
+            max_ms = std::max(max_ms, ms);
+        }
+        double steady_avg_ms = steady_sum / steady_count;
+        double steady_tok_s = 1000.0 / steady_avg_ms;
+        fprintf(stderr, "Steady-State Decode:  %.2f tok/s (avg=%.1f ms/tok, min=%.1f ms, max=%.1f ms, n=%zu)\n",
+                steady_tok_s, steady_avg_ms, min_ms, max_ms, steady_count);
+    }
     fprintf(stderr, "Total End-to-End:     %.3f s (%.2f tok/s)\n", total_secs, (tokens.size() + n_decoded) / total_secs);
     fprintf(stderr, "----------------------------------------------------------------------------\n");
     fprintf(stderr, "Decode GPU VRAM Hits: %ld / %ld (%.1f%%, 0 ms PCIe transfer)\n", st.decode_hits, total_refs, gpu_hit_rate);

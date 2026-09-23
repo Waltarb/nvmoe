@@ -32,3 +32,4 @@ env/
 *~
 .vscode/
 .idea/
+*.log

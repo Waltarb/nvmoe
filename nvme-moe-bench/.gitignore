@@ -1,0 +1,35 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment & venv
+.env
+.venv
+venv/
+ENV/
+
+# Scratch & temporary benchmark artifacts
+scratch/
+archive/
+*.tmp
+*.bak
+
+# Raw benchmark output — hardware-, drive- and config-specific, not reproducible
+# elsewhere. The durable record is performance.md, not these JSON dumps.
+benchmarks/results/
+
+# Runtime and diagnostic logs
+*.log
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db

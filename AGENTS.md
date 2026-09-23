@@ -52,14 +52,16 @@ if (strncmp(t->name, "ffn_moe_weights-", 16) != 0) return true;
 ```
 **Why**: Downstream reshaped view tensors (or fused tensors) can trigger `eval_cb` with null or secondary source operands (`t->src[1] == nullptr`). Attempting to dereference router inputs on non-weight tensors causes immediate segmentation faults.
 
-### 2.3 Non-Blocking Asynchronous CUDA Synchronization
-To achieve high decode token throughput (>5 tok/s), host-to-device transfers must not block the CPU thread:
-- H2D copies are enqueued to a dedicated stream: `st->h2d_stream`.
-- A CUDA event is recorded immediately after the copies:
+### 2.3 Non-Blocking Pipelined Asynchronous CUDA Synchronization
+To achieve high decode token throughput (up to 8.0 tok/s steady-state), host-to-device transfers must completely overlap with NVMe reads without blocking the CPU thread:
+- **Instant Host Hit Transfers**: Any expert that hits the pinned host RAM cache is dispatched immediately via `cudaMemcpyAsync` on `st->h2d_stream` *before* the layer's NVMe read queue is submitted.
+- **CQE-Triggered H2D Transfers**: As each pending NVMe expert's blocks land via `io_uring_wait_cqe`, its H2D copy is enqueued to `st->h2d_stream` immediately, overlapping any subsequent disk reads.
+- **Zero-Block Hardware Synchronization**:
+  A CUDA event is recorded immediately after all copies:
   ```cpp
   cudaEventRecord(st->h2d_event, st->h2d_stream);
   ```
-- The main computation stream waits on the event inside the CUDA driver:
+  The main computation stream waits on the event inside the CUDA driver:
   ```cpp
   cudaStreamWaitEvent(cudaStreamPerThread, st->h2d_event, 0);
   ```

@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Developer Focus Hub — Productivity Dashboard</title>
+  <style>
+    :root {
+      --bg-gradient: radial-gradient(circle at 20% 20%, #1a1e29 0%, #0d1117 100%);
+      --card-bg: rgba(26, 31, 46, 0.7);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --text-main: #f0f6fc;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-glow: rgba(88, 166, 255, 0.3);
+      --success: #3fb950;
+      --danger: #f85149;
+      --shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+      --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    [data-theme="light"] {
+      --bg-gradient: radial-gradient(circle at 20% 20%, #eef2f7 0%, #dfe5ed 100%);
+      --card-bg: rgba(255, 255, 255, 0.75);
+      --card-border: rgba(0, 0, 0, 0.08);
+      --text-main: #1f2328;
+      --text-muted: #656d76;
+      --accent: #0969da;
+      --accent-glow: rgba(9, 105, 218, 0.25);
+      --success: #1a7f37;
+      --danger: #cf222e;
+      --shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      transition: background 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+    }
+
+    body {
+      min-height: 100vh;
+      background: var(--bg-gradient);
+      color: var(--text-main);
+      font-family: var(--font-family);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1.5rem;
+    }
+
+    header {
+      width: 100%;
+      max-width: 1100px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 2rem;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .brand-logo {
+      width: 38px;
+      height: 38px;
+      background: linear-gradient(135deg, var(--accent), #bc8cff);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-weight: bold;
+      font-size: 1.2rem;
+      box-shadow: 0 4px 12px var(--accent-glow);
+    }
+
+    .brand h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .theme-toggle {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      color: var(--text-main);
+      padding: 0.6rem 1.1rem;
+      border-radius: 30px;
+      cursor: pointer;
+      font-size: 0.95rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      backdrop-filter: blur(12px);
+      box-shadow: var(--shadow);
+    }
+
+    .theme-toggle:hover {
+      border-color: var(--accent);
+      transform: translateY(-1px);
+    }
+
+    .dashboard-grid {
+      width: 100%;
+      max-width: 1100px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1.5rem;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 18px;
+      padding: 1.75rem;
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .card h2 {
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 1.25rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    /* Clock Card */
+    .clock-display {
+      text-align: center;
+      margin: auto 0;
+      padding: 1.5rem 0;
+    }
+
+    .time-text {
+      font-size: 3.5rem;
+      font-weight: 800;
+      letter-spacing: -1px;
+      color: var(--text-main);
+      font-variant-numeric: tabular-nums;
+      text-shadow: 0 4px 20px var(--accent-glow);
+    }
+
+    .greeting-text {
+      font-size: 1.25rem;
+      font-weight: 500;
+      color: var(--accent);
+      margin-top: 0.5rem;
+    }
+
+    .date-text {
+      font-size: 0.95rem;
+      color: var(--text-muted);
+      margin-top: 0.25rem;
+    }
+
+    /* Pomodoro Timer */
+    .timer-modes {
+      display: flex;
+      gap: 0.5rem;
+      justify-content: center;
+      margin-bottom: 1.5rem;
+    }
+
+    .mode-btn {
+      background: transparent;
+      border: 1px solid var(--card-border);
+      color: var(--text-muted);
+      padding: 0.4rem 0.8rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .mode-btn.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      box-shadow: 0 4px 12px var(--accent-glow);
+    }
+
+    .timer-container {
+      position: relative;
+      width: 180px;
+      height: 180px;
+      margin: 0 auto 1.5rem auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .timer-svg {
+      width: 100%;
+      height: 100%;
+      transform: rotate(-90deg);
+    }
+
+    .timer-bg-circle {
+      fill: none;
+      stroke: var(--card-border);
+      stroke-width: 8;
+    }
+
+    .timer-progress-circle {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 8;
+      stroke-linecap: round;
+      stroke-dasharray: 326.7;
+      stroke-dashoffset: 0;
+      transition: stroke-dashoffset 0.4s ease, stroke 0.3s ease;
+    }
+
+    .timer-number {
+      position: absolute;
+      font-size: 2.2rem;
+      font-weight: 700;
+      color: var(--text-main);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .timer-controls {
+      display: flex;
+      gap: 0.75rem;
+      justify-content: center;
+    }
+
+    .btn {
+      padding: 0.65rem 1.4rem;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      cursor: pointer;
+      border: 1px solid transparent;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 4px 14px var(--accent-glow);
+    }
+
+    .btn-primary:hover {
+      filter: brightness(1.1);
+    }
+
+    .btn-secondary {
+      background: transparent;
+      border-color: var(--card-border);
+      color: var(--text-muted);
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--text-main);
+      color: var(--text-main);
+    }
+
+    /* Tasks / Todo */
+    .task-input-row {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+    }
+
+    .task-input {
+      flex: 1;
+      background: rgba(0, 0, 0, 0.15);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 0.65rem 0.9rem;
+      color: var(--text-main);
+      font-size: 0.95rem;
+      outline: none;
+    }
+
+    [data-theme="light"] .task-input {
+      background: rgba(255, 255, 255, 0.8);
+    }
+
+    .task-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+
+    .task-list {
+      list-style: none;
+      overflow-y: auto;
+      max-height: 230px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .task-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.6rem 0.75rem;
+      background: rgba(0, 0, 0, 0.1);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      font-size: 0.9rem;
+    }
+
+    [data-theme="light"] .task-item {
+      background: rgba(255, 255, 255, 0.5);
+    }
+
+    .task-label {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      cursor: pointer;
+      flex: 1;
+      user-select: none;
+    }
+
+    .task-item.done .task-text {
+      text-decoration: line-through;
+      color: var(--text-muted);
+    }
+
+    .task-delete-btn {
+      background: transparent;
+      border: none;
+      color: var(--danger);
+      cursor: pointer;
+      font-size: 1.1rem;
+      padding: 0 0.4rem;
+      opacity: 0.7;
+    }
+
+    .task-delete-btn:hover {
+      opacity: 1;
+    }
+
+    .task-stats {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      text-align: right;
+      margin-top: auto;
+    }
+
+    footer {
+      margin-top: 2.5rem;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      text-align: center;
+    }
+
+    @media (max-width: 768px) {
+      .time-text { font-size: 2.75rem; }
+      .dashboard-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-logo">⚡</div>
+      <h1>FocusHub</h1>
+    </div>
+    <button class="theme-toggle" id="themeToggle" aria-label="Toggle Theme">
+      <span id="themeIcon">☀️</span> <span id="themeText">Light Mode</span>
+    </button>
+  </header>
+
+  <main class="dashboard-grid">
+    <!-- Clock & Greeting Card -->
+    <section class="card">
+      <h2><span>🕒</span> Live Status</h2>
+      <div class="clock-display">
+        <div class="time-text" id="clockTime">00:00:00</div>
+        <div class="greeting-text" id="clockGreeting">Hello, Developer</div>
+        <div class="date-text" id="clockDate">Monday, September 8, 2026</div>
+      </div>
+    </section>
+
+    <!-- Pomodoro Timer Card -->
+    <section class="card">
+      <h2><span>⏳</span> Focus Timer</h2>
+      <div class="timer-modes">
+        <button class="mode-btn active" data-time="1500">Focus (25m)</button>
+        <button class="mode-btn" data-time="300">Short Break (5m)</button>
+        <button class="mode-btn" data-time="900">Long Break (15m)</button>
+      </div>
+      <div class="timer-container">
+        <svg class="timer-svg" viewBox="0 0 120 120">
+          <circle class="timer-bg-circle" cx="60" cy="60" r="52"></circle>
+          <circle class="timer-progress-circle" id="timerProgress" cx="60" cy="60" r="52"></circle>
+        </svg>
+        <div class="timer-number" id="timerDisplay">25:00</div>
+      </div>
+      <div class="timer-controls">
+        <button class="btn btn-primary" id="timerStartPause">Start</button>
+        <button class="btn btn-secondary" id="timerReset">Reset</button>
+      </div>
+    </section>
+
+    <!-- Quick Tasks Card -->
+    <section class="card">
+      <h2><span>📋</span> Quick Tasks</h2>
+      <div class="task-input-row">
+        <input type="text" class="task-input" id="taskInput" placeholder="Add a new task..." />
+        <button class="btn btn-primary" id="taskAddBtn">Add</button>
+      </div>
+      <ul class="task-list" id="taskList"></ul>
+      <div class="task-stats" id="taskStats">0 of 0 tasks completed</div>
+    </section>
+  </main>
+
+  <footer>
+    Generated by <strong>Qwen3.8-Flash-Next NVFP4</strong> on FreeToken 3-Tier NVMe MoE Cache
+  </footer>
+
+  <script>
+    // --- 1. Theme Management ---
+    const themeToggle = document.getElementById("themeToggle");
+    const themeIcon = document.getElementById("themeIcon");
+    const themeText = document.getElementById("themeText");
+    const htmlEl = document.documentElement;
+
+    function applyTheme(theme) {
+      htmlEl.setAttribute("data-theme", theme);
+      localStorage.setItem("theme", theme);
+      if (theme === "light") {
+        themeIcon.textContent = "🌙";
+        themeText.textContent = "Dark Mode";
+      } else {
+        themeIcon.textContent = "☀️";
+        themeText.textContent = "Light Mode";
+      }
+    }
+
+    const savedTheme = localStorage.getItem("theme") || "dark";
+    applyTheme(savedTheme);
+
+    themeToggle.addEventListener("click", () => {
+      const current = htmlEl.getAttribute("data-theme");
+      applyTheme(current === "dark" ? "light" : "dark");
+    });
+
+    // --- 2. Live Digital Clock & Greeting ---
+    const clockTime = document.getElementById("clockTime");
+    const clockGreeting = document.getElementById("clockGreeting");
+    const clockDate = document.getElementById("clockDate");
+
+    function updateClock() {
+      const now = new Date();
+      const hours = now.getHours();
+      const mins = String(now.getMinutes()).padStart(2, "0");
+      const secs = String(now.getSeconds()).padStart(2, "0");
+      clockTime.textContent = `${String(hours).padStart(2, "0")}:${mins}:${secs}`;
+
+      let greeting = "Good evening, Developer";
+      if (hours >= 5 && hours < 12) greeting = "Good morning, Developer ☕";
+      else if (hours >= 12 && hours < 17) greeting = "Good afternoon, Developer 🚀";
+      else if (hours >= 17 && hours < 22) greeting = "Good evening, Developer 🌙";
+      else greeting = "Late night coding, Developer ✨";
+      clockGreeting.textContent = greeting;
+
+      const options = { weekday: "long", year: "numeric", month: "long", day: "numeric" };
+      clockDate.textContent = now.toLocaleDateString(undefined, options);
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+
+    // --- 3. Pomodoro Focus Timer ---
+    let totalSeconds = 1500;
+    let remainingSeconds = 1500;
+    let timerInterval = null;
+    let isRunning = false;
+    const CIRCUMFERENCE = 2 * Math.PI * 52; // ~326.72
+
+    const timerDisplay = document.getElementById("timerDisplay");
+    const timerProgress = document.getElementById("timerProgress");
+    const timerStartPause = document.getElementById("timerStartPause");
+    const timerReset = document.getElementById("timerReset");
+    const modeBtns = document.querySelectorAll(".mode-btn");
+
+    function updateTimerDisplay() {
+      const m = Math.floor(remainingSeconds / 60);
+      const s = remainingSeconds % 60;
+      timerDisplay.textContent = `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+      const fraction = remainingSeconds / totalSeconds;
+      const offset = CIRCUMFERENCE * (1 - fraction);
+      timerProgress.style.strokeDashoffset = offset;
+    }
+
+    function startTimer() {
+      if (isRunning) return;
+      isRunning = true;
+      timerStartPause.textContent = "Pause";
+      timerInterval = setInterval(() => {
+        if (remainingSeconds > 0) {
+          remainingSeconds--;
+          updateTimerDisplay();
+        } else {
+          clearInterval(timerInterval);
+          isRunning = false;
+          timerStartPause.textContent = "Start";
+          alert("Focus session completed! Great job!");
+        }
+      }, 1000);
+    }
+
+    function pauseTimer() {
+      if (!isRunning) return;
+      clearInterval(timerInterval);
+      isRunning = false;
+      timerStartPause.textContent = "Start";
+    }
+
+    timerStartPause.addEventListener("click", () => {
+      if (isRunning) pauseTimer();
+      else startTimer();
+    });
+
+    timerReset.addEventListener("click", () => {
+      pauseTimer();
+      remainingSeconds = totalSeconds;
+      updateTimerDisplay();
+    });
+
+    modeBtns.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        modeBtns.forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        totalSeconds = parseInt(btn.dataset.time, 10);
+        remainingSeconds = totalSeconds;
+        pauseTimer();
+        updateTimerDisplay();
+      });
+    });
+    updateTimerDisplay();
+
+    // --- 4. Quick Tasks / Todo ---
+    const taskInput = document.getElementById("taskInput");
+    const taskAddBtn = document.getElementById("taskAddBtn");
+    const taskList = document.getElementById("taskList");
+    const taskStats = document.getElementById("taskStats");
+
+    let tasks = JSON.parse(localStorage.getItem("tasks") || "[]");
+    if (tasks.length === 0) {
+      tasks = [
+        { id: 1, text: "Review MoE NVMe benchmark results", done: true },
+        { id: 2, text: "Explore zero-copy io_uring kernel stats", done: false },
+        { id: 3, text: "Optimize multi-turn radix prefix hit rate", done: false }
+      ];
+    }
+
+    function saveAndRenderTasks() {
+      localStorage.setItem("tasks", JSON.stringify(tasks));
+      taskList.innerHTML = "";
+      tasks.forEach((task) => {
+        const li = document.createElement("li");
+        li.className = `task-item ${task.done ? "done" : ""}`;
+        li.innerHTML = `
+          <label class="task-label">
+            <input type="checkbox" ${task.done ? "checked" : ""} data-id="${task.id}" />
+            <span class="task-text">${escapeHtml(task.text)}</span>
+          </label>
+          <button class="task-delete-btn" data-id="${task.id}">✕</button>
+        `;
+        taskList.appendChild(li);
+      });
+      const completed = tasks.filter((t) => t.done).length;
+      taskStats.textContent = `${completed} of ${tasks.length} tasks completed`;
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement("div");
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function addTask() {
+      const text = taskInput.value.trim();
+      if (!text) return;
+      tasks.push({ id: Date.now(), text, done: false });
+      taskInput.value = "";
+      saveAndRenderTasks();
+    }
+
+    taskAddBtn.addEventListener("click", addTask);
+    taskInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") addTask();
+    });
+
+    taskList.addEventListener("click", (e) => {
+      if (e.target.matches("input[type='checkbox']")) {
+        const id = Number(e.target.dataset.id);
+        const task = tasks.find((t) => t.id === id);
+        if (task) {
+          task.done = e.target.checked;
+          saveAndRenderTasks();
+        }
+      } else if (e.target.matches(".task-delete-btn")) {
+        const id = Number(e.target.dataset.id);
+        tasks = tasks.filter((t) => t.id !== id);
+        saveAndRenderTasks();
+      }
+    });
+
+    saveAndRenderTasks();
+  </script>
+</body>
+</html>

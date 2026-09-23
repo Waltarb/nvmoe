@@ -1,0 +1,757 @@
+diff -ruN -x __pycache__ -x '*.pyc' a/freetoken/engine/engine.py b/freetoken/engine/engine.py
+--- a/freetoken/engine/engine.py	2026-09-09 09:16:51.546035824 +0200
++++ b/freetoken/engine/engine.py	2026-09-09 09:16:51.551231506 +0200
+@@ -20,6 +20,51 @@
+ 
+ from .config import EngineConfig
+ from .graph import GraphRunner, get_free_memory
++from .layer_graph import MoeLayerGraphRunner
++
++# Escape hatch (FREETOKEN_HYBRID_OVERLAP precedent): partial per-layer CUDA graph
++# capture for offload-MoE decode (see layer_graph.py). Only wired up for
++# Qwen4ExpForCausalLM + an active offload cache + bs=1 decode; every other config
++# keeps using the whole-model GraphRunner exactly as before.
++_LAYER_CUDA_GRAPH = os.getenv("FREETOKEN_LAYER_CUDA_GRAPH", "0") == "1"
++
++
++def _select_graph_runner(
++    *, stream, device, model, attn_backend, cuda_graph_bs, cuda_graph_max_bs,
++    free_memory, max_seq_len, vocab_size, dummy_req, moe_offload_cache, max_running_req,
++):
++    if (
++        _LAYER_CUDA_GRAPH
++        and moe_offload_cache is not None
++        and max_running_req == 1
++        and (cuda_graph_max_bs is None or cuda_graph_max_bs >= 1)
++        and type(model).__name__ == "Qwen4ExpForCausalLM"
++    ):
++        logger = init_logger(__name__)
++        logger.info_rank0("FREETOKEN_LAYER_CUDA_GRAPH=1: using MoeLayerGraphRunner (bs=1 only)")
++        return MoeLayerGraphRunner(
++            stream=stream,
++            device=device,
++            model=model,
++            attn_backend=attn_backend,
++            max_seq_len=max_seq_len,
++            vocab_size=vocab_size,
++            dummy_req=dummy_req,
++            moe_offload_cache=moe_offload_cache,
++        )
++    return GraphRunner(
++        stream=stream,
++        device=device,
++        model=model,
++        attn_backend=attn_backend,
++        cuda_graph_bs=cuda_graph_bs,
++        cuda_graph_max_bs=cuda_graph_max_bs,
++        free_memory=free_memory,
++        max_seq_len=max_seq_len,
++        vocab_size=vocab_size,
++        dummy_req=dummy_req,
++        moe_offload_cache=moe_offload_cache,
++    )
+ from .sample import BatchSamplingArgs, Sampler
+ from freetoken.kvcache import create_kv_pool, resolve_pool_class
+ from freetoken.kvcache.base import CacheRebuildRejected
+@@ -414,7 +459,7 @@
+         if self.linear_state_pool is not None:
+             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
+         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+-        self.graph_runner = GraphRunner(
++        self.graph_runner = _select_graph_runner(
+             stream=self.stream,
+             device=self.device,
+             model=self.model,
+@@ -426,6 +471,7 @@
+             vocab_size=config.model_config.vocab_size,
+             dummy_req=self.dummy_req,
+             moe_offload_cache=self.moe_offload_cache,
++            max_running_req=config.max_running_req,
+         )
+         if config.attention_backend.split(",")[0] == "triton":
+             # Prefill runs on the first comma part; warm its autotune cache.
+@@ -907,7 +953,7 @@
+         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
+         gc.collect()
+         free_min = self._sync_get_memory()[0]
+-        self.graph_runner = GraphRunner(
++        self.graph_runner = _select_graph_runner(
+             stream=self.stream,
+             device=self.device,
+             model=self.model,
+@@ -919,12 +965,21 @@
+             vocab_size=config.model_config.vocab_size,
+             dummy_req=self.dummy_req,
+             moe_offload_cache=self.moe_offload_cache,
++            max_running_req=config.max_running_req,
+         )
+ 
+     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+         assert torch.cuda.current_stream() == self.stream
+         use_graph = self.graph_runner.can_use_cuda_graph(batch)
+-        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
++        # The disk-PLE WAIT/signal protocol (ple_disk.py) assumes one graph replay
++        # then Python-only work until its deferred host fill runs; MoeLayerGraphRunner
++        # interleaves a blocking host sync (offload MoE's ensure_experts) between
++        # per-layer graph replays, which would deadlock against that protocol. It
++        # never captures layer 0's PLE lookup (kept eager every replay -- see
++        # layer_graph.py's module docstring), so tell PLE to use its own eager,
++        # non-deferred fill path here too, independent of the MoE graph decision.
++        ple_use_graph = use_graph and not isinstance(self.graph_runner, MoeLayerGraphRunner)
++        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, ple_use_graph):
+             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+         if self.cpu_moe_executor is not None:
+             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
+diff -ruN -x __pycache__ -x '*.pyc' a/freetoken/engine/layer_graph.py b/freetoken/engine/layer_graph.py
+--- a/freetoken/engine/layer_graph.py	1970-01-01 01:00:00.000000000 +0100
++++ b/freetoken/engine/layer_graph.py	2026-09-09 09:16:51.551256511 +0200
+@@ -0,0 +1,294 @@
++"""Partial CUDA-graph capture for Qwen3.8-Flash-Next's offload-MoE decode path.
++
++``GraphRunner`` (``graph.py``) captures ``model.forward()`` whole, which only works when
++every op the forward touches is capture-safe. ``NvmeOffloadMoeCache.ensure_experts``
++(``nvme_offload_cache.py``) is not: it calls ``.item()`` and ``.cpu().tolist()`` to decide
++which experts need an NVMe ``preadv`` before the GPU-side slot cache can be updated, and
++both calls are illegal inside ``torch.cuda.graph()`` capture.
++
++``MoeLayerGraphRunner`` captures everything BETWEEN the MoE calls instead: per decoder
++layer, the hyper-connection mix/combine and the GDN/QSA attention op never touch expert
++paging (static resident buffers, fixed shapes, no host sync), so each of those spans
++becomes its own tiny CUDA graph, with the MoE dispatch itself left eager in between.
++
++Region layout (see ``models/qwen4_exp/model.py:76-86`` for the reference eager forward):
++
++    Graph[0]    = attn_hc.mix(0) + attn/GDN(0) + attn_hc.combine(0) + mlp_hc.mix(0)
++    <eager>     = MoE(0)
++    Graph[L]    = mlp_hc.combine(L-1) + attn_hc.mix(L) + attn/GDN(L)
++                  + attn_hc.combine(L) + mlp_hc.mix(L)              for L = 1..num_layers-1
++    <eager>     = MoE(L)
++    Graph[tail] = mlp_hc.combine(num_layers-1) + hyper_connection_mixer.mix + lm_head
++
++Merging layer L-1's ``mlp_hc.combine`` into layer L's graph (instead of giving it a
++standalone one-kernel graph) avoids replaying a whole CUDA graph for a single kernel,
++which is the one case in this model where the fixed per-replay overhead could rival the
++eager dispatch cost it's trying to avoid.
++
++Cross-graph data (values a later graph's capture reads that an earlier graph's capture,
++or the eager MoE call in between, produced) is staged through persistent buffers exactly
++like ``GraphCaptureBuffer`` stages ``input_ids``/``positions`` for the whole-model runner:
++``x_buf`` (post-attn-combine hidden), ``s_buf`` (the mlp-mix inject logits), ``moe_in_buf``
++(the MoE call's input), ``y_buf`` (the MoE call's output). ``shared_gate_mul_add``
++allocates its output fresh every call (``moe_shared_gate.py``), so ``y_buf`` is not
++optional -- without it, the next graph would read whatever the caching allocator happened
++to place at that now-stale address.
++
++Each layer graph gets its OWN CUDA graph memory pool (no ``pool=`` sharing across the
++per-layer graphs, unlike ``GraphRunner``'s same-shape multi-bs graphs, which share one
++pool because their tensors are never read across pool boundaries). QSA's
++``_plan_index_writes`` (``attention/qsa_sparse.py``) allocates ``cmp_rows``/``ring_rows``
++fresh on the first QSA layer of a forward and every later QSA layer reads that same
++Python-held tensor reference; if two of my layer graphs shared a pool, the allocator could
++place a later graph's own scratch tensor at that exact address, silently corrupting the
++read. Giving each layer its own pool keeps that address reserved for the life of the
++runner (we hold every ``CUDAGraph`` object in ``self.graphs``), at the cost of a little
++extra VRAM -- see the runner's log line for the measured delta.
++
++The disk PLE backend's WAIT/signal protocol (``models/qwen4_exp/ple_disk.py``) assumes one
++graph replay followed immediately by Python-only work until the deferred host fill runs;
++threading a blocking host sync (MoE's ``ensure_experts``) between a captured PLE lookup and
++that deferred fill would deadlock the decode step. So layer 0's ``ple.forward`` (and the
++embedding lookup that feeds it) stay eager here, every replay, never captured -- see
++``EngineWithLayerGraph.forward_batch`` in ``engine.py`` for the matching
++``forward_host_ctx(batch, use_graph=False)`` override that keeps PLE's own graph/non-graph
++branch consistent with that choice.
++
++Scope: bs=1 decode only (this model's deployed config runs `--max-running-req 1`, which
++collapses GDN's recurrent state to one slot; a batched version would need per-bs graph
++sets exactly like ``GraphRunner``'s ``graph_bs_list``, which is future work, not attempted
++here).
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, List
++
++import torch
++from freetoken.core import Batch, Req, get_global_ctx
++from freetoken.utils import init_logger, mem_GB
++
++from .graph import get_free_memory
++
++if TYPE_CHECKING:
++    from freetoken.attention import BaseAttnBackend
++    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
++    from freetoken.moe.offload_cache import OffloadMoeCache
++
++logger = init_logger(__name__)
++
++
++class MoeLayerGraphRunner:
++    """Drop-in alternative to ``GraphRunner`` for bs=1 offload-MoE decode.
++
++    Implements the same call surface (``can_use_cuda_graph``, ``replay``, ``pad_batch``,
++    ``destroy_cuda_graphs``) so ``engine.py`` can hold either behind ``self.graph_runner``.
++    """
++
++    def __init__(
++        self,
++        stream: torch.cuda.Stream,
++        device: torch.device,
++        model: "Qwen4ExpForCausalLM",
++        attn_backend: "BaseAttnBackend",
++        max_seq_len: int,
++        vocab_size: int,
++        dummy_req: Req,
++        moe_offload_cache: "OffloadMoeCache | None",
++    ) -> None:
++        self.attn_backend = attn_backend
++        self.dummy_req = dummy_req
++        self.moe_offload_cache = moe_offload_cache
++        self.stream = stream
++        self.device = device
++        self.model = model
++        self.qwen_model = model.model  # Qwen4ExpModel
++        self.layers = list(self.qwen_model.layers.op_list)
++        self.num_layers = len(self.layers)
++        self.hc_count = self.qwen_model.hc_count
++        self.hidden_size = model._config.hidden_size
++        self.vocab_size = vocab_size
++        self.graphs: List[torch.cuda.CUDAGraph] = []
++        self.max_graph_bs = 1  # can_use_cuda_graph gate; bs=1 only
++        self.graph_bs_list = [1]
++        self._capture(max_seq_len)
++
++    # ------------------------------------------------------------------
++    # Capture
++    # ------------------------------------------------------------------
++
++    def _make_batch(self) -> Batch:
++        batch = Batch(reqs=[self.dummy_req], phase="decode")
++        batch.padded_reqs = batch.reqs
++        return batch
++
++    def _bind_step_buffers(self, batch: Batch) -> None:
++        """Point this step's ``batch`` at the persistent input buffers (mirrors
++        ``GraphCaptureBuffer.set_batch``)."""
++        from freetoken.attention.linear import FLAMetadata
++
++        batch.input_ids = self.input_ids
++        batch.out_loc = self.out_loc
++        batch.positions = self.positions
++        batch.linear_table_idx = self.table_idx
++        batch.fla_metadata = FLAMetadata(
++            cu_seqlens=self.fla_cu_seqlens, cache_indices=self.table_idx
++        )
++
++    def _layer_pre_moe(self, layer, hidden: torch.Tensor, batch: Batch):
++        block_input, inject_a = layer.attn_hyper_connection.mix(hidden)
++        if layer._is_linear:
++            block_output = layer.linear_attn.forward(block_input)
++        else:
++            block_output = layer.self_attn.forward(block_input, batch)
++        x_mid = layer.attn_hyper_connection.combine(hidden, block_output, inject_a)
++        moe_input, inject_m = layer.mlp_hyper_connection.mix(x_mid)
++        return x_mid, moe_input, inject_m
++
++    def _layer_post_moe(self, layer, x_mid: torch.Tensor, moe_out: torch.Tensor, inject_m: torch.Tensor):
++        return layer.mlp_hyper_connection.combine(x_mid, moe_out, inject_m)
++
++    def _refresh_embed_buf(self, batch: Batch) -> None:
++        """Embedding lookup + layer 0's PLE (if any): kept eager, never captured -- see
++        the module docstring for why (disk-PLE WAIT/signal deadlock risk). Writes into
++        ``embed_buf``, which graph[0]'s capture only ever READS -- the lookup itself
++        never runs inside a ``torch.cuda.graph()`` context."""
++        hidden = self.qwen_model.embed_tokens.forward(self.input_ids).repeat(1, self.hc_count)
++        layer0 = self.layers[0]
++        if layer0.ple is not None:
++            hidden = hidden + layer0.ple.forward(hidden, batch)
++        self.embed_buf.copy_(hidden)
++
++    def _reset_moe_offload_cache(self) -> None:
++        if self.moe_offload_cache is not None:
++            self.moe_offload_cache.reset()
++
++    def _capture(self, max_seq_len: int) -> None:
++        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=[1])
++
++        torch.cuda.synchronize(self.device)
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats(self.device)
++        free_before = get_free_memory(self.device)
++        logger.info_rank0(f"Free GPU memory before layer-graph capture: {mem_GB(free_before)}")
++
++        dev = self.device
++        model_dtype = self.qwen_model.embed_tokens.weight.dtype
++        self.input_ids = torch.zeros(1, dtype=torch.int32, device=dev)
++        self.out_loc = torch.zeros(1, dtype=torch.int32, device=dev)
++        self.positions = torch.zeros(1, dtype=torch.int32, device=dev)
++        self.table_idx = torch.zeros(1, dtype=torch.int32, device=dev)
++        self.fla_cu_seqlens = torch.arange(2, dtype=torch.int32, device=dev)
++        self.embed_buf = torch.zeros(1, self.hc_count * self.hidden_size, dtype=model_dtype, device=dev)
++        self.x_buf = torch.zeros(1, self.hc_count * self.hidden_size, dtype=model_dtype, device=dev)
++        self.s_buf = torch.zeros(1, self.hc_count, dtype=model_dtype, device=dev)
++        self.moe_in_buf = torch.zeros(1, self.hidden_size, dtype=model_dtype, device=dev)
++        self.y_buf = torch.zeros(1, self.hidden_size, dtype=model_dtype, device=dev)
++        self.logits_buf = torch.empty(1, self.vocab_size, dtype=torch.float32, device=dev)
++
++        batch = self._make_batch()
++        self._bind_step_buffers(batch)
++        dummy_slot = (
++            self.dummy_req.linear_slot_idx
++            if self.dummy_req.linear_slot_idx is not None
++            else self.dummy_req.table_idx
++        )
++        self.table_idx.fill_(dummy_slot)
++        self.attn_backend.prepare_for_capture(batch)
++        self._reset_moe_offload_cache()
++
++        with get_global_ctx().forward_batch(batch):
++            for layer_idx, layer in enumerate(self.layers):
++                self._capture_layer_graph(layer_idx, layer, batch)
++                # Eager MoE dispatch: warm it (NVMe/host resolution), then reset the
++                # offload cache so the NEXT (real) run replays cold-cache expert copies,
++                # matching GraphRunner's own warm-then-reset convention.
++                y = layer.mlp.forward(self.moe_in_buf)
++                self.y_buf.copy_(y)
++                self._reset_moe_offload_cache()
++
++            self._capture_tail_graph()
++
++        free_after = get_free_memory(self.device)
++        logger.info_rank0(
++            f"Layer-graph capture done: {len(self.graphs)} graphs, "
++            f"free GPU memory before={mem_GB(free_before)} after={mem_GB(free_after)} "
++            f"(pool overhead ~{mem_GB(free_before - free_after)})"
++        )
++
++    def _capture_layer_graph(self, layer_idx: int, layer, batch: Batch) -> None:
++        graph = torch.cuda.CUDAGraph()
++
++        def region_input() -> torch.Tensor:
++            if layer_idx == 0:
++                return self.embed_buf
++            prev = self.layers[layer_idx - 1]
++            return self._layer_post_moe(prev, self.x_buf, self.y_buf, self.s_buf)
++
++        if layer_idx == 0:
++            self._refresh_embed_buf(batch)
++        # Warm once eagerly first (autotune caches, lazy metadata) before recording.
++        x_mid, moe_input, inject_m = self._layer_pre_moe(layer, region_input(), batch)
++        self.x_buf.copy_(x_mid)
++        self.moe_in_buf.copy_(moe_input)
++        self.s_buf.copy_(inject_m)
++
++        with torch.cuda.graph(graph, stream=self.stream):
++            x_mid, moe_input, inject_m = self._layer_pre_moe(layer, region_input(), batch)
++            self.x_buf.copy_(x_mid)
++            self.moe_in_buf.copy_(moe_input)
++            self.s_buf.copy_(inject_m)
++        self.graphs.append(graph)
++
++    def _capture_tail_graph(self) -> None:
++        graph = torch.cuda.CUDAGraph()
++        last = self.layers[-1]
++        hidden = self._layer_post_moe(last, self.x_buf, self.y_buf, self.s_buf)
++        mixed = self.qwen_model.hyper_connection_mixer.mix(hidden)[0]
++        logits = self.model.lm_head.forward(mixed)
++        self.logits_buf.copy_(logits)
++
++        with torch.cuda.graph(graph, stream=self.stream):
++            hidden = self._layer_post_moe(last, self.x_buf, self.y_buf, self.s_buf)
++            mixed = self.qwen_model.hyper_connection_mixer.mix(hidden)[0]
++            logits = self.model.lm_head.forward(mixed)
++            self.logits_buf.copy_(logits)
++        self.graphs.append(graph)
++
++    # ------------------------------------------------------------------
++    # Replay
++    # ------------------------------------------------------------------
++
++    def can_use_cuda_graph(self, batch: Batch) -> bool:
++        return batch.is_decode and batch.size == 1
++
++    def pad_batch(self, batch: Batch) -> None:
++        batch.padded_reqs = batch.reqs
++
++    def replay(self, batch: Batch) -> torch.Tensor:
++        assert self.can_use_cuda_graph(batch)
++        self.input_ids.copy_(batch.input_ids)
++        if batch.out_loc is not None:
++            self.out_loc.copy_(batch.out_loc)
++        self.positions.copy_(batch.positions)
++        if batch.linear_table_idx is not None:
++            self.table_idx.copy_(batch.linear_table_idx)
++        self._bind_step_buffers(batch)
++        self.attn_backend.prepare_for_replay(batch)
++        self._refresh_embed_buf(batch)
++
++        for layer_idx, layer in enumerate(self.layers):
++            self.graphs[layer_idx].replay()
++            y = layer.mlp.forward(self.moe_in_buf)
++            self.y_buf.copy_(y)
++        self.graphs[self.num_layers].replay()
++        return self.logits_buf[: batch.size]
++
++    def destroy_cuda_graphs(self) -> None:
++        import gc
++
++        self.graphs = []
++        for name in ("embed_buf", "x_buf", "s_buf", "moe_in_buf", "y_buf", "logits_buf",
++                     "input_ids", "out_loc", "positions", "table_idx", "fla_cu_seqlens"):
++            setattr(self, name, None)
++        gc.collect()
+diff -ruN -x __pycache__ -x '*.pyc' a/freetoken/models/qwen4_exp/model.py b/freetoken/models/qwen4_exp/model.py
+--- a/freetoken/models/qwen4_exp/model.py	2026-09-09 09:16:51.548222915 +0200
++++ b/freetoken/models/qwen4_exp/model.py	2026-09-09 09:16:51.556514050 +0200
+@@ -28,6 +28,35 @@
+ from .moe import Qwen4ExpMoE
+ from .ple import PLELayer
+ 
++import os as _os
++import time as _time
++
++# Toggleable (default off), per RESULTS_AND_FINDINGS.md #19: measures the backbone
++# (pre-MoE) span's CPU wall-clock dispatch time against its actual GPU execution time
++# (torch.cuda.Event pair), to see whether backbone dispatch is CPU-exposed or already
++# hidden behind GPU catch-up from the previous layer's MoE work. Flushed (one
++# cudaEventSynchronize) every _BACKBONE_FLUSH calls, not every layer, so this doesn't
++# itself add a sync per layer.
++_BACKBONE_TRACE = _os.getenv("FREETOKEN_TRACE_BACKBONE", "0") == "1"
++_BACKBONE_FLUSH = 480  # 10 decode tokens at 48 layers/token
++_backbone_pending: list = []
++_backbone_cpu_s = 0.0
++_backbone_calls = 0
++
++# Toggleable (default off), per RESULTS_AND_FINDINGS.md #20 step 2: brackets the WHOLE
++# self.mlp.forward(...) call (gate GEMM, shared expert, ensure_experts' sync+NVMe wait,
++# copy_missing, routed-expert GEMM, shared_gate_mul_add) with one CUDA event pair. Because
++# torch.cuda.Event.elapsed_time measures wall-clock time between two stream markers (not
++# "GPU busy time"), this INCLUDES the sync/NVMe idle gap -- deliberately: the residual
++# compute estimate is this total MINUS the sync/NVMe/host-bookkeeping totals already
++# measured by NvmeOffloadMoeCache's own timers (FREETOKEN_TRACE_SYNC), not a standalone
++# number. Compare them for the same run.
++_MOE_TRACE = _os.getenv("FREETOKEN_TRACE_MOE", "0") == "1"
++_MOE_FLUSH = 480
++_moe_pending: list = []
++_moe_cpu_s = 0.0
++_moe_calls = 0
++
+ if TYPE_CHECKING:
+     from freetoken.core import Batch
+     from freetoken.models.config import ModelConfig
+@@ -55,6 +84,45 @@
+     )
+ 
+ 
++def _flush_backbone_trace() -> None:
++    global _backbone_pending, _backbone_cpu_s, _backbone_calls
++    if not _backbone_pending:
++        return
++    torch.cuda.synchronize()
++    gpu_ms = sum(s.elapsed_time(e) for s, e in _backbone_pending)
++    from freetoken.utils import init_logger
++
++    init_logger(__name__).info(
++        f"[Backbone Trace] {_backbone_calls} layer spans: "
++        f"CPU dispatch {_backbone_cpu_s * 1000:.1f}ms total "
++        f"({_backbone_cpu_s / _backbone_calls * 1000:.4f}ms/call) | "
++        f"GPU execution {gpu_ms:.1f}ms total ({gpu_ms / _backbone_calls:.4f}ms/call)"
++    )
++    _backbone_pending = []
++    _backbone_cpu_s = 0.0
++    _backbone_calls = 0
++
++
++def _flush_moe_trace() -> None:
++    global _moe_pending, _moe_cpu_s, _moe_calls
++    if not _moe_pending:
++        return
++    torch.cuda.synchronize()
++    gpu_ms = sum(s.elapsed_time(e) for s, e in _moe_pending)
++    from freetoken.utils import init_logger
++
++    init_logger(__name__).info(
++        f"[MoE Trace] {_moe_calls} layer spans: "
++        f"CPU wall {_moe_cpu_s * 1000:.1f}ms total ({_moe_cpu_s / _moe_calls * 1000:.4f}ms/call) | "
++        f"GPU-stream elapsed {gpu_ms:.1f}ms total ({gpu_ms / _moe_calls:.4f}ms/call) "
++        f"(includes the sync/NVMe idle gap -- subtract FREETOKEN_TRACE_SYNC's totals for "
++        f"the same run to get residual compute)"
++    )
++    _moe_pending = []
++    _moe_cpu_s = 0.0
++    _moe_calls = 0
++
++
+ class Qwen4ExpDecoderLayer(BaseOP):
+     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
+ 
+@@ -76,6 +144,12 @@
+     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+         if self.ple is not None:
+             hidden = hidden + self.ple.forward(hidden, batch)
++        if _BACKBONE_TRACE:
++            global _backbone_cpu_s, _backbone_calls
++            start_ev = torch.cuda.Event(enable_timing=True)
++            end_ev = torch.cuda.Event(enable_timing=True)
++            _cpu_t0 = _time.perf_counter()
++            start_ev.record()
+         block_input, inject = self.attn_hyper_connection.mix(hidden)
+         if self._is_linear:
+             block_output = self.linear_attn.forward(block_input)
+@@ -83,6 +157,27 @@
+             block_output = self.self_attn.forward(block_input, batch)
+         hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+         block_input, inject = self.mlp_hyper_connection.mix(hidden)
++        if _BACKBONE_TRACE:
++            end_ev.record()
++            _backbone_cpu_s += _time.perf_counter() - _cpu_t0
++            _backbone_calls += 1
++            _backbone_pending.append((start_ev, end_ev))
++            if _backbone_calls >= _BACKBONE_FLUSH:
++                _flush_backbone_trace()
++        if _MOE_TRACE:
++            global _moe_cpu_s, _moe_calls
++            moe_start_ev = torch.cuda.Event(enable_timing=True)
++            moe_end_ev = torch.cuda.Event(enable_timing=True)
++            _moe_cpu_t0 = _time.perf_counter()
++            moe_start_ev.record()
++            moe_out = self.mlp.forward(block_input)
++            moe_end_ev.record()
++            _moe_cpu_s += _time.perf_counter() - _moe_cpu_t0
++            _moe_calls += 1
++            _moe_pending.append((moe_start_ev, moe_end_ev))
++            if _moe_calls >= _MOE_FLUSH:
++                _flush_moe_trace()
++            return self.mlp_hyper_connection.combine(hidden, moe_out, inject)
+         return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+ 
+ 
+diff -ruN -x __pycache__ -x '*.pyc' a/freetoken/models/qwen4_exp/moe.py b/freetoken/models/qwen4_exp/moe.py
+--- a/freetoken/models/qwen4_exp/moe.py	2026-09-09 09:16:51.548228644 +0200
++++ b/freetoken/models/qwen4_exp/moe.py	2026-09-09 09:16:51.556525014 +0200
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import os as _os
++import time as _time
+ from dataclasses import replace
+ from typing import TYPE_CHECKING
+ 
+@@ -11,6 +13,37 @@
+ if TYPE_CHECKING:
+     from freetoken.models.config import ModelConfig
+ 
++# Toggleable (default off), per RESULTS_AND_FINDINGS.md #22 (Phase A): brackets the
++# pre-routing span (gate GEMM + shared-expert dense GEMM + shared_gate_sigmoid) with a
++# CUDA event pair, so it can be subtracted from the existing whole-`mlp.forward()` bracket
++# (model.py's FREETOKEN_TRACE_MOE) to isolate `self.experts.forward` (sync + NVMe +
++# copy_missing + routed GEMM) from gate/shared-expert compute. Flushed (one
++# cudaEventSynchronize) every _PRE_ROUTING_FLUSH calls, not every layer.
++_TRACE_MOE_SPLIT = _os.getenv("FREETOKEN_TRACE_MOE_SPLIT", "0") == "1"
++_PRE_ROUTING_FLUSH = 480  # 10 decode tokens at 48 layers/token
++_pre_routing_pending: list = []
++_pre_routing_cpu_s = 0.0
++_pre_routing_calls = 0
++
++
++def _flush_pre_routing_trace() -> None:
++    global _pre_routing_pending, _pre_routing_cpu_s, _pre_routing_calls
++    if not _pre_routing_pending:
++        return
++    torch.cuda.synchronize()
++    gpu_ms = sum(s.elapsed_time(e) for s, e in _pre_routing_pending)
++    from freetoken.utils import init_logger
++
++    init_logger(__name__).info(
++        f"[Pre-Routing Trace] {_pre_routing_calls} layer spans: "
++        f"CPU wall {_pre_routing_cpu_s * 1000:.1f}ms total "
++        f"({_pre_routing_cpu_s / _pre_routing_calls * 1000:.4f}ms/call) | "
++        f"GPU-stream elapsed {gpu_ms:.1f}ms total ({gpu_ms / _pre_routing_calls:.4f}ms/call)"
++    )
++    _pre_routing_pending = []
++    _pre_routing_cpu_s = 0.0
++    _pre_routing_calls = 0
++
+ 
+ class Qwen4ExpMoE(Qwen3_5MoE):
+     """Qwen3_5MoE with the shared-expert gate on triton instead of gemv + sigmoid + mul + add.
+@@ -36,9 +69,22 @@
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
+         hidden_states = hidden_states.view(-1, hidden_dim)
++        if _TRACE_MOE_SPLIT:
++            global _pre_routing_cpu_s, _pre_routing_calls
++            start_ev = torch.cuda.Event(enable_timing=True)
++            end_ev = torch.cuda.Event(enable_timing=True)
++            _cpu_t0 = _time.perf_counter()
++            start_ev.record()
+         router_logits = self.gate.forward(hidden_states)
+         shared = self.shared_expert.forward(hidden_states)
+         gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
++        if _TRACE_MOE_SPLIT:
++            end_ev.record()
++            _pre_routing_cpu_s += _time.perf_counter() - _cpu_t0
++            _pre_routing_calls += 1
++            _pre_routing_pending.append((start_ev, end_ev))
++            if _pre_routing_calls >= _PRE_ROUTING_FLUSH:
++                _flush_pre_routing_trace()
+         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+         return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
+ 
+diff -ruN -x __pycache__ -x '*.pyc' a/freetoken/models/qwen4_exp/ple_disk.py b/freetoken/models/qwen4_exp/ple_disk.py
+--- a/freetoken/models/qwen4_exp/ple_disk.py	2026-09-09 09:16:51.548244525 +0200
++++ b/freetoken/models/qwen4_exp/ple_disk.py	2026-09-09 09:16:51.556352222 +0200
+@@ -95,6 +95,28 @@
+ 
+ def resolve_row_source(folder: str) -> PleRowSource:
+     """Pick the row source for a checkpoint; the seam where a repacked format would plug in."""
++    import json
++    ngram_json = os.path.join(folder, "qwen4_ngram.json")
++    ngram_bin = os.path.join(folder, "qwen4_ngram.bin")
++    if os.path.isfile(ngram_json) and os.path.isfile(ngram_bin):
++        with open(ngram_json) as f:
++            meta = json.load(f)
++        parts = int(meta["parts"])
++        rows = int(meta["rows"])
++        dim = int(meta["dim"])
++        rows_per_extent = rows // parts
++        bytes_per_extent = rows_per_extent * dim
++        extent_base = [i * bytes_per_extent for i in range(parts)]
++        extent_file = [0] * parts
++        return PleRowSource(
++            paths=[ngram_bin],
++            extent_file=extent_file,
++            extent_base=extent_base,
++            rows_per_extent=rows_per_extent,
++            row_bytes=dim,
++            row_stride=dim,
++            scale=float(meta["weight_scale"]),
++        )
+     return source_from_safetensors(folder)
+ 
+ 
+@@ -158,6 +180,9 @@
+         self._flag.zero_()
+         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
+         self._readback_event = torch.cuda.Event()
++        self.time_ple_fill_s = 0.0
++        self.time_ple_lookup_s = 0.0
++        self.ple_fill_calls = 0
+         sync = "wait-sync" if self._wait_sync else "launch-gating"
+         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
+ 
+@@ -184,12 +209,22 @@
+ 
+     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
+         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
++        import time
++        t0 = time.perf_counter()
+         pinned = self._graph_pinned if graph else self._eager_pinned
+         offset = 0
+         for run in runs:
+             self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
+             offset += run.numel() - 2
+         self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
++        self.time_ple_fill_s += (time.perf_counter() - t0)
++        self.ple_fill_calls += 1
++        if self.ple_fill_calls % 10 == 0:
++            logger.info(
++                f"[PLE Telemetry] Fills: {self.ple_fill_calls} | "
++                f"Total Fill Time: {self.time_ple_fill_s:.3f}s | "
++                f"Avg Fill: {self.time_ple_fill_s/self.ple_fill_calls*1000:.2f}ms"
++            )
+ 
+     def host_fill_batch(self, batch: Batch, use_graph: bool):
+         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
+diff -ruN -x __pycache__ -x '*.pyc' a/freetoken/models/qwen4_exp/weight.py b/freetoken/models/qwen4_exp/weight.py
+--- a/freetoken/models/qwen4_exp/weight.py	2026-09-09 09:16:51.548250838 +0200
++++ b/freetoken/models/qwen4_exp/weight.py	2026-09-09 09:16:51.556364861 +0200
+@@ -109,9 +109,17 @@
+     if raw_name.endswith(_SCALE_SUFFIXES):
+         return None
+     if raw_name.startswith("model.language_model."):
+-        return "model." + raw_name[len("model.language_model.") :]
+-    if raw_name.startswith("language_model."):
+-        return "model." + raw_name[len("language_model.") :]
++        raw_name = "model." + raw_name[len("model.language_model.") :]
++    elif raw_name.startswith("language_model."):
++        raw_name = "model." + raw_name[len("language_model.") :]
++
++    if ".self_attn.index_qk_proj." in raw_name:
++        raw_name = raw_name.replace(".self_attn.index_qk_proj.", ".self_attn.indexer.index_qk_proj.")
++    elif ".self_attn.index_q_norm." in raw_name:
++        raw_name = raw_name.replace(".self_attn.index_q_norm.", ".self_attn.indexer.q_layernorm.")
++    elif ".self_attn.index_k_norm." in raw_name:
++        raw_name = raw_name.replace(".self_attn.index_k_norm.", ".self_attn.indexer.k_layernorm.")
++
+     return raw_name
+ 
+ 
+diff -ruN -x __pycache__ -x '*.pyc' a/freetoken/models/weight.py b/freetoken/models/weight.py
+--- a/freetoken/models/weight.py	2026-09-09 09:16:51.547537481 +0200
++++ b/freetoken/models/weight.py	2026-09-09 09:16:51.554689291 +0200
+@@ -235,15 +235,48 @@
+     from freetoken.models.config import VISION_KEY_PREFIXES, vision_load_enabled
+ 
+     if is_ftw_checkpoint(model_path):
+-        # The FTW dense shard stores whatever existed at conversion, including the vision
+-        # stack. Vision is opt-in (default OFF, see vision_load_enabled): when it is off the
+-        # model never builds the tower, so replaying those tensors would trip load_state_dict's
+-        # strict unexpected-key check. Skip them here to match the model the engine built.
++        import importlib
++
+         skip_vision = not vision_load_enabled()
++        _config, spec = _spec_for_model_path(model_path)
++        try:
++            mod = importlib.import_module(f"{spec.module}.weight")
++            try_fuse = getattr(mod, "_try_fuse", None)
++            rename = getattr(mod, "_rename", None)
++        except Exception:
++            try_fuse = None
++            rename = None
++
++        buf = {}
+         for name, tensor in iter_ftw_weights(model_path):
+             if skip_vision and name.startswith(VISION_KEY_PREFIXES):
+                 continue
++            if rename is not None:
++                name = rename(name)
++                if name is None:
++                    continue
++            if try_fuse is not None:
++                res = try_fuse(name, tensor, buf)
++                if res is not None:
++                    if res:
++                        yield res
++                    continue
+             yield name, tensor
++
++        if spec.module == "freetoken.models.qwen4_exp":
++            from freetoken.models.qwen4_exp.ple import derive_ngram_hash_constants
++            args = _config.qwen4_args
++            for ple_idx, layer_id in enumerate(args.ple_layer_ids):
++                mult, sizes, offsets = derive_ngram_hash_constants(
++                    vocab_size=_config.vocab_size,
++                    ngram_size=args.ngram_size,
++                    num_ngram_heads=args.num_ngram_heads,
++                    ngram_vocab_size_base=args.ngram_vocab_size_base,
++                    ple_layer_index=ple_idx,
++                )
++                yield f"model.layers.{layer_id}.ple.ple_embedding.layer_multipliers", torch.tensor(mult, dtype=torch.int64)
++                yield f"model.layers.{layer_id}.ple.ple_embedding.ngram_heads_vocab_sizes", torch.tensor(sizes, dtype=torch.int64)
++                yield f"model.layers.{layer_id}.ple.ple_embedding.ngram_heads_offsets", torch.tensor(offsets, dtype=torch.int64)
+         return
+ 
+     _config, spec = _spec_for_model_path(model_path)
+diff -ruN -x __pycache__ -x '*.pyc' a/freetoken/moe/host_banks.py b/freetoken/moe/host_banks.py
+--- a/freetoken/moe/host_banks.py	2026-09-09 09:16:51.548353312 +0200
++++ b/freetoken/moe/host_banks.py	2026-09-09 09:16:51.556795498 +0200
+@@ -105,7 +105,7 @@
+             assert self.addr % _BLK == 0
+             self._pinned = True  # born pinned+mapped; pin() is a no-op
+         else:
+-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
++            self._buf = mmap.mmap(-1, asize, flags=mmap.MAP_PRIVATE)  # lazy: address space only, no resident pages yet
+             _LIVE_BUFFERS.append(self._buf)
+             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+             self._pinned = False

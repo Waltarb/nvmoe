@@ -16,11 +16,14 @@ By combining direct Linux **`io_uring` NVMe streaming**, **pinned Host RAM segme
 ### 1. Qwen3.8-Flash-Next (NVFP4, 48 Layers, 512 Experts)
 Evaluated on **NVIDIA RTX 3080 Ti Laptop GPU (16 GB VRAM)**, PCIe Gen4 NVMe SSD, Host RAM 31 GiB DDR5:
 
-| Configuration | Decode Throughput | In-Memory Hit Rate | GPU VRAM Hit Rate | Peak VRAM |
+| Configuration | Decode Throughput | Steady-State Decode | TTFT Prefill | Peak VRAM |
 |---|---|---|---|---|
-| **FreeToken Baseline** | 4.64 – 5.70 tok/s | ~80% | N/A | ~13.5 GiB |
-| **NVMoE Cold Start (16 GPU slots)** | 1.36 tok/s | 32.1% | 19.4% | ~9.8 GiB |
-| **NVMoE Optimized (48 GPU slots / 128 Host slots)** | **5.04 tok/s** | **82.6%** | **59.2%** | **~12.6 GiB** |
+| **FreeToken Baseline** | 4.64 – 5.70 tok/s | ~5.70 tok/s | ~7.0 – 7.9 s | ~13.5 GiB |
+| **FreeToken Peak Pipelined (§39.3)** | 6.57 tok/s | N/A | ~7.0 s | ~13.5 GiB |
+| **NVMoE Cold Start (16 GPU slots)** | 1.36 tok/s | 1.40 tok/s | 11.2 s | ~9.8 GiB |
+| **NVMoE Phase 8 (Sequential H2D)** | 5.04 tok/s | 5.10 tok/s | 4.57 s | ~12.6 GiB |
+| **NVMoE Pipelined Overlap (50-tok)** | **7.88 tok/s** | **8.00 tok/s** (125.0 ms/tok) | **3.24 s** (8.3 tok/s) | **~12.6 GiB** |
+| **NVMoE Pipelined Overlap (150-tok sustained)** | **6.78 tok/s** | **6.76 tok/s** (147.9 ms/tok) | **3.15 s** (8.6 tok/s) | **~12.6 GiB** |
 
 *Verified coherent, fluent output on factual and reasoning tasks at `temperature=0`.*
 
@@ -198,6 +201,7 @@ nvmoe-llamacpp/
 │   ├── expert_reader_batch.cpp  # liburing async NVMe reader implementation
 │   ├── segmented_host_lru.hpp   # Pinned host RAM segmented LRU cache header
 │   └── bench_expert_io.cpp      # Standalone NVMe IO throughput benchmark
+├── nvme-moe-bench/              # Historical benchmark suite, findings, and models from FreeToken
 └── llama.cpp/                   # Git submodule pointing to ggml-org/llama.cpp
 ```
 
