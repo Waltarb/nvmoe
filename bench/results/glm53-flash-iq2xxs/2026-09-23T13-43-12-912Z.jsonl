@@ -1,0 +1,1 @@
+{"config":"glm53-flash-iq2xxs","task":"01-paginate-bugfix","category":"bugfix","run":1,"solved":false,"hiddenPassed":0,"hiddenTotal":7,"specGreen":false,"tscOk":true,"turns":1,"formatErrors":1,"applyErrors":0,"stopReason":"budget","promptTokens":549,"outputTokens":1200,"usageEstimated":false,"ttftMs":[19579],"decodeTokS":[28.16],"wallMs":62657}

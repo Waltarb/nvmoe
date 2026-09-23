@@ -1,0 +1,1 @@
+{"config":"glm53-flash-iq2xxs","task":"04-cart-reducer","category":"state","run":1,"solved":true,"hiddenPassed":10,"hiddenTotal":10,"specGreen":true,"tscOk":true,"turns":1,"formatErrors":0,"applyErrors":0,"stopReason":"spec_green","promptTokens":676,"outputTokens":522,"usageEstimated":false,"ttftMs":[385130],"decodeTokS":[1.47],"wallMs":739726}

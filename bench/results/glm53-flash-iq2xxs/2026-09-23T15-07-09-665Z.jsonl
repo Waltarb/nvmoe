@@ -1,0 +1,1 @@
+{"config":"glm53-flash-iq2xxs","task":"05-user-name-split","category":"multi-file","run":1,"solved":false,"hiddenPassed":7,"hiddenTotal":8,"specGreen":true,"tscOk":true,"turns":1,"formatErrors":0,"applyErrors":3,"stopReason":"done","promptTokens":561,"outputTokens":931,"usageEstimated":false,"ttftMs":[311619],"decodeTokS":[1.54],"wallMs":917662}

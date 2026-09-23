@@ -1,0 +1,1 @@
+{ "tier": "smoke", "category": "bugfix", "maxTurns": 3, "outputBudget": 1200, "timeoutSec": 1500 }

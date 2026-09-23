@@ -1,8 +1,11 @@
 # Large Model weights
 models/*.gguf
+models/**/*.gguf
 models/*.ftw
 models/*.bin
 !models/freq_qwen38.bin
+!models/freq_glm53.bin
+models/glm-5.3-flash-iq2xxs/
 
 # Binaries and compiled targets
 moe_cache_probe

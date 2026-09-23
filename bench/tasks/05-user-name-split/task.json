@@ -1,0 +1,1 @@
+{ "tier": "smoke", "category": "multi-file", "maxTurns": 3, "outputBudget": 1500, "timeoutSec": 1800 }

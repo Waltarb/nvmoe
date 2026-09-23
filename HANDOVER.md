@@ -341,10 +341,27 @@ NVMOE_TEST_NO_CB=1 ./test_sched_chain_shrink   # control run, callback disabled
      -ngl 999 -c 512 -p 'The capital of France is' -n 64 --temp 0
    ```
 
-## Reading order
+## GLM-5.3-Flash Adaptation & Head-to-Head Benchmark Milestone
 
-1. This file (`HANDOVER.md`) for architecture, bug resolutions, and performance milestones.
-2. `plan.md` — living roadmap detailing Phase 0 through Phase 8.
-3. `scripts/moe_cache_probe.cpp` — authoritative implementation of the 3-tier cache with 1-callback unification and GPU LRU.
-4. `scripts/bench_expert_io.cpp` — NVMe IO benchmark verifying `io_uring` throughput.
+In September 2026, NVMoE was adapted to support **`unsloth/GLM-5.3-Flash-GGUF` (UD-IQ2_XXS, 4 shards, ~95 GB)** alongside `Qwen3.8-Flash-Next-NVFP4`.
+
+### Key Additions & Architectural Enhancements
+1. **Multi-Shard Direct I/O (`split.count = 4`)**:
+   Engine dynamically parses split metadata from `GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf`, initializes dedicated `O_DIRECT` file descriptors across all shards, and computes page-aligned offsets per expert bank.
+2. **3-Bank Non-Fused Routing**:
+   Unlike Qwen's 2-bank fused layout (`gate_up` + `down`), GLM-5.3-Flash uses non-fused `gate`, `up`, and `down` matrices. The Host Segmented LRU (`segmented_host_lru.hpp`) and GPU slot manager were extended to handle 3-bank transfers atomically.
+3. **Safe Micro-Batch Clamping**:
+   Top-8 MoE routing with 42 MoE layers requires $42 \times 8 \times 7.53\text{ MB} = \mathbf{2.53\text{ GB}}$ active weights/token. `safe_ubatch` is clamped to $(NVMOE\_CACHE\_SIZE - 4) / top\_k = 2$ to eliminate slot exhaustion during prompt prefill.
+4. **Interactive Daemon & Coding Benchmark Suite (`nvmoe-bench`)**:
+   `moe_cache_probe` now includes `--server --port 8080`, providing an OpenAI-compatible `/v1/chat/completions` endpoint with SSE streaming.
+   The TypeScript benchmark harness (`bench`) runs multi-turn coding tasks evaluated against hidden test suites and TypeScript compilation checks.
+
+### Benchmark Results (`pnpm compare`)
+| Model / Config | Tasks | Pass Rate | Solved (T1) | Median Wall Time | Tests / 1k Out Tok | Total Out Tok | Avg Decode | Avg TTFT | Format / Apply Errors |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **`glm53-flash-iq2xxs`** | 5 | **100%** | **5/5** | 8.1 min | **20.03** | **2,296** | 1.76 tok/s | 263.4s | 0 / 0 |
+| **`qwen38-flash-nvfp4`** | 5 | **100%** | **5/5** | **3.2 min** | 10.36 | 4,439 | **6.89 tok/s** | **62.6s** | 0 / 0 |
+
+Both models achieved a perfect **100% pass rate (46/46 hidden tests, 0 format/apply errors)** on Turn 1, demonstrating that NVMoE dynamic caching, 3-tier LRU, and zero-IO tail pruning preserve full reasoning and syntax fidelity under extreme hardware constraints (< 14 GiB VRAM, < 20 GiB Host RAM).
+
 

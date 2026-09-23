@@ -132,14 +132,38 @@ Expected output:
 - In-memory hit rate: **> 80%**.
 - Output text: Coherent generation ending with `"The capital of France is **Paris**."`
 
+### Standard Verification Run (GLM-5.3-Flash-UD-IQ2_XXS)
+```bash
+GGML_CUDA_DISABLE_GRAPHS=1 \
+NVMOE_CACHE_SIZE=20 \
+NVMOE_GPU_PINNED_EXPERTS=10 \
+NVMOE_HOST_CACHE_SIZE=48 \
+NVMOE_PINNED_EXPERTS=32 \
+NVMOE_PRUNE_NVME_THRESH=0.10 \
+NVMOE_PRUNE_MIN_KEEP=4 \
+NVMOE_FREQ_PATH=models/freq_glm53.bin \
+./moe_cache_probe \
+  -m models/glm-5.3-flash-iq2xxs/UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf \
+  -c 2048 \
+  --server --port 8080
+```
+
+### Running the Benchmark Suite (`nvmoe-bench`)
+```bash
+cd bench
+BENCH_ENDPOINT=http://localhost:8080/v1 BENCH_MODEL=local pnpm bench --config glm53-flash-iq2xxs --tier smoke
+pnpm compare
+```
+
 ---
 
 ## 5. Next Planned Milestones
 
-When extending this repository, focus on these three priorities:
-1. **Interactive CLI / Server Mode**:
-   Wrap `moe_cache_probe`'s engine into an interactive terminal chat loop or lightweight HTTP server (OpenAI-compatible `/v1/chat/completions`) so users can test multi-turn conversations without restarting the cache.
-2. **Speculative Prefetch (Layer $l+1$ Lookahead)**:
-   Predict top-$k$ expert candidates for Layer $l+1$ while Layer $l$'s GEMMs are running on the GPU, achieving full overlap and pushing decode throughput towards 6–7 tok/s.
-3. **Upstream PR Packaging**:
+When extending this repository, focus on these priorities:
+1. **Speculative Prefetch (Layer $l+1$ Lookahead)**:
+   Predict top-$k$ expert candidates for Layer $l+1$ while Layer $l$'s GEMMs are running on the GPU, achieving full overlap and pushing decode throughput higher.
+2. **Upstream PR Packaging**:
    Clean up the changes in `scripts/llama_cpp_nvmoe.patch` to match `llama.cpp` coding guidelines for upstream submission.
+3. **Multi-Turn KV Cache Management**:
+   Enhance context window sliding / prefix reuse in server daemon mode for extended multi-turn dialogs.
+

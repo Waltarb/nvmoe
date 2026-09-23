@@ -1,0 +1,1 @@
+{"config":"glm53-flash-iq2xxs","task":"03-validate-signup","category":"api","run":1,"solved":true,"hiddenPassed":10,"hiddenTotal":10,"specGreen":true,"tscOk":true,"turns":1,"formatErrors":0,"applyErrors":0,"stopReason":"spec_green","promptTokens":574,"outputTokens":410,"usageEstimated":false,"ttftMs":[260663],"decodeTokS":[1.8],"wallMs":488570}

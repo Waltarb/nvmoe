@@ -23,6 +23,14 @@
 #include "gguf.h"
 #include "segmented_host_lru.hpp"
 
+#define CPPHTTPLIB_NO_OPENSSL
+#include <cpp-httplib/httplib.h>
+#include <nlohmann/json.hpp>
+#include <mutex>
+#include <sstream>
+
+using json = nlohmann::json;
+
 #include <liburing.h>
 #include <cuda_runtime.h>
 
@@ -43,6 +51,7 @@ static inline size_t align_down(size_t x) { return x - (x % ALIGN); }
 static inline size_t align_up(size_t x)   { return ((x + ALIGN - 1) / ALIGN) * ALIGN; }
 
 struct read_job {
+    int fd;
     size_t offset;
     size_t len;
     uint8_t * out;
@@ -99,11 +108,19 @@ struct uring_reader {
     }
 };
 
+struct gguf_shard {
+    std::string path;
+    int fd_direct = -1;
+    struct gguf_context * gctx = nullptr;
+    struct ggml_context * meta_ctx = nullptr;
+};
+
 // One routed-expert weight bank (gate_exps, up_exps, or down_exps) for one layer:
 // where its real per-expert rows live on disk, and the GPU-resident (shrunk) tensor
 // they get copied into.
 struct expert_bank {
     ggml_tensor * gpu_tensor = nullptr; // shape [.., .., cache_size] if shrunk, else full
+    int           fd_direct   = -1;     // shard file descriptor for O_DIRECT reads
     size_t        base_offset = 0;      // file offset of real expert 0's row
     size_t        row_bytes   = 0;      // bytes per real expert (== nb[2] of the real tensor)
 };
@@ -211,6 +228,7 @@ struct cache_state {
     float    prune_nvme_thresh = 0.0f;
     int      prune_min_keep = 6;
     float    prune_min_mass = 0.95f;
+    int      expert_used_count = 8;
     std::vector<layer_cache> layers; // indexed by layer id parsed from tensor name
 
     uring_reader uring;
@@ -224,7 +242,7 @@ struct cache_state {
         cudaDeviceGetStreamPriorityRange(&least_pri, &greatest_pri);
         cudaStreamCreateWithPriority(&h2d_stream, cudaStreamNonBlocking, greatest_pri);
         cudaEventCreateWithFlags(&h2d_event, cudaEventDisableTiming);
-        cudaHostAlloc((void **)&pinned_ids, 4096 * sizeof(int32_t), cudaHostAllocDefault);
+        cudaHostAlloc((void **)&pinned_ids, 262144 * sizeof(int32_t), cudaHostAllocDefault);
         cudaHostAlloc((void **)&pinned_weights, 4096 * sizeof(float), cudaHostAllocDefault);
     }
     ~cache_state() {
@@ -244,11 +262,13 @@ struct cache_state {
             cudaStreamDestroy(h2d_stream);
             h2d_stream = nullptr;
         }
-        if (fd_direct >= 0) {
-            close(fd_direct);
-            fd_direct = -1;
+        for (int fd : shard_fds) {
+            if (fd >= 0) close(fd);
         }
+        shard_fds.clear();
+        fd_direct = -1;
     }
+    std::vector<int> shard_fds;
 };
 
 static int parse_layer_id(const char * name) {
@@ -263,7 +283,7 @@ static bool read_jobs_batch(cache_state & st, const std::vector<read_job> & jobs
     if (jobs.empty()) return true;
     if (!st.uring.initialized) {
         for (const auto & j : jobs) {
-            if (!read_odirect(st.fd_direct, j.offset, j.len, j.out)) return false;
+            if (!read_odirect(j.fd, j.offset, j.len, j.out)) return false;
         }
         return true;
     }
@@ -278,7 +298,7 @@ static bool read_jobs_batch(cache_state & st, const std::vector<read_job> & jobs
             size_t aligned_len  = align_up(front_pad + j.len);
 
             io_uring_sqe * sqe = io_uring_get_sqe(&st.uring.ring);
-            io_uring_prep_read(sqe, st.fd_direct, st.uring.staging_buffers[i], aligned_len, aligned_off);
+            io_uring_prep_read(sqe, j.fd, st.uring.staging_buffers[i], aligned_len, aligned_off);
             io_uring_sqe_set_data64(sqe, i);
         }
 
@@ -654,6 +674,7 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     // --- Step 3: Pipelined NVMe reads + instant H2D dispatch per completed expert ---
     if (!nvme_tasks.empty()) {
         struct nvme_subjob {
+            int fd;
             size_t offset;
             size_t len;
             uint8_t * out;
@@ -665,12 +686,12 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 
         for (auto & t : nvme_tasks) {
             if (lc.fused_gate_up) {
-                subjobs.push_back({ lc.gate_up.base_offset + (size_t) t.real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(t.host_slot), 0, &t });
-                subjobs.push_back({ lc.down.base_offset    + (size_t) t.real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(t.host_slot),    0, &t });
+                subjobs.push_back({ lc.gate_up.fd_direct, lc.gate_up.base_offset + (size_t) t.real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(t.host_slot), 0, &t });
+                subjobs.push_back({ lc.down.fd_direct,    lc.down.base_offset    + (size_t) t.real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(t.host_slot),    0, &t });
             } else {
-                subjobs.push_back({ lc.gate.base_offset + (size_t) t.real_id * lc.gate.row_bytes, lc.gate.row_bytes, lc.host_gate.slot_ptr(t.host_slot), 0, &t });
-                subjobs.push_back({ lc.up.base_offset   + (size_t) t.real_id * lc.up.row_bytes,   lc.up.row_bytes,   lc.host_up.slot_ptr(t.host_slot),   0, &t });
-                subjobs.push_back({ lc.down.base_offset + (size_t) t.real_id * lc.down.row_bytes, lc.down.row_bytes, lc.host_down.slot_ptr(t.host_slot), 0, &t });
+                subjobs.push_back({ lc.gate.fd_direct, lc.gate.base_offset + (size_t) t.real_id * lc.gate.row_bytes, lc.gate.row_bytes, lc.host_gate.slot_ptr(t.host_slot), 0, &t });
+                subjobs.push_back({ lc.up.fd_direct,   lc.up.base_offset   + (size_t) t.real_id * lc.up.row_bytes,   lc.up.row_bytes,   lc.host_up.slot_ptr(t.host_slot),   0, &t });
+                subjobs.push_back({ lc.down.fd_direct, lc.down.base_offset + (size_t) t.real_id * lc.down.row_bytes, lc.down.row_bytes, lc.host_down.slot_ptr(t.host_slot), 0, &t });
             }
         }
 
@@ -696,7 +717,7 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 
         if (!st->uring.initialized) {
             for (auto & sj : subjobs) {
-                if (!read_odirect(st->fd_direct, sj.offset, sj.len, sj.out)) {
+                if (!read_odirect(sj.fd, sj.offset, sj.len, sj.out)) {
                     fprintf(stderr, "[cache] FATAL: read_odirect failed\n");
                     abort();
                 }
@@ -717,7 +738,7 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                     size_t aligned_len  = align_up(front_pad + sj.len);
 
                     io_uring_sqe * sqe = io_uring_get_sqe(&st->uring.ring);
-                    io_uring_prep_read(sqe, st->fd_direct, st->uring.staging_buffers[i], aligned_len, aligned_off);
+                    io_uring_prep_read(sqe, sj.fd, st->uring.staging_buffers[i], aligned_len, aligned_off);
                     io_uring_sqe_set_data64(sqe, (uint64_t)&sj);
                 }
 
@@ -781,17 +802,16 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                             st->pinned_ids + row * n_expert_used,
                             n_expert_used * sizeof(int32_t),
                             cudaMemcpyHostToDevice,
-                            cudaStreamPerThread);
+                            st->h2d_stream);
         }
+        cudaStreamSynchronize(st->h2d_stream);
     } else {
         for (int64_t row = 0; row < n_tokens; row++) {
             ggml_backend_tensor_set(selected_experts, ids.data() + row * n_expert_used, row * selected_experts->nb[1], n_expert_used * sizeof(int32_t));
         }
-    }
-
-    if (any_gpu_fill) {
-        cudaEventRecord(st->h2d_event, st->h2d_stream);
-        cudaStreamWaitEvent(cudaStreamPerThread, st->h2d_event, 0);
+        if (any_gpu_fill) {
+            cudaStreamSynchronize(st->h2d_stream);
+        }
     }
 
     st->callback_hits++;
@@ -800,40 +820,101 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 
 // Parse the GGUF file's per-layer expert-bank offsets/strides (same approach as
 // scripts/gguf_expert_meta.cpp, Phase 2 step 1 -- verified against this exact model).
-static bool describe_bank(struct gguf_context * gctx, struct ggml_context * meta_ctx, int il, const char * suffix, expert_bank & out) {
+static bool describe_bank(const std::vector<gguf_shard> & shards, int il, const char * suffix, expert_bank & out) {
     char name[128];
     snprintf(name, sizeof(name), "blk.%d.%s.weight", il, suffix);
-    int64_t tid = gguf_find_tensor(gctx, name);
-    if (tid < 0) {
-        return false;
+    for (const auto & sh : shards) {
+        int64_t tid = gguf_find_tensor(sh.gctx, name);
+        if (tid < 0) {
+            continue;
+        }
+        ggml_tensor * t = ggml_get_tensor(sh.meta_ctx, name);
+        if (!t) {
+            continue;
+        }
+        out.fd_direct   = sh.fd_direct;
+        out.base_offset = gguf_get_data_offset(sh.gctx) + gguf_get_tensor_offset(sh.gctx, tid);
+        out.row_bytes   = t->nb[2];
+        if (getenv("NVMOE_DEBUG_ALIGNMENT")) {
+            fprintf(stderr, "[alignment] %s in %s: base_offset=%zu (%%4096=%zu) row_bytes=%zu (%%4096=%zu)\n",
+                    name, sh.path.c_str(), out.base_offset, out.base_offset % 4096, out.row_bytes, out.row_bytes % 4096);
+        }
+        return true;
     }
-    ggml_tensor * t = ggml_get_tensor(meta_ctx, name);
-    if (!t) {
-        return false;
-    }
-    out.base_offset = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid);
-    out.row_bytes   = t->nb[2];
-    if (il == 0 && getenv("NVMOE_DEBUG_LAYER0")) {
-        fprintf(stderr, "[alignment] %s base_offset=%zu (%%4096=%zu) row_bytes=%zu (%%4096=%zu)\n",
-                name, out.base_offset, out.base_offset % 4096, out.row_bytes, out.row_bytes % 4096);
-    }
-    return true;
+    return false;
 }
 
 static void setup_cache(cache_state & st, llama_model * model, const char * gguf_path, int n_layer) {
-    st.fd_direct = open(gguf_path, O_RDONLY | O_DIRECT);
-    if (st.fd_direct < 0) {
-        fprintf(stderr, "[cache] FATAL: open(O_DIRECT) failed for %s: %s\n", gguf_path, strerror(errno));
-        abort();
-    }
-
-    struct ggml_context * meta_ctx = nullptr;
-    struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta_ctx };
-    struct gguf_context * gctx = gguf_init_from_file(gguf_path, gp);
-    if (!gctx) {
+    struct ggml_context * init_meta = nullptr;
+    struct gguf_init_params init_gp = { /*.no_alloc =*/ true, /*.ctx =*/ &init_meta };
+    struct gguf_context * init_gctx = gguf_init_from_file(gguf_path, init_gp);
+    if (!init_gctx) {
         fprintf(stderr, "[cache] FATAL: gguf_init_from_file failed for %s\n", gguf_path);
         abort();
     }
+
+    int32_t split_count = 1;
+    int kid_sc = gguf_find_key(init_gctx, "split.count");
+    if (kid_sc >= 0) {
+        split_count = gguf_get_val_u16(init_gctx, kid_sc);
+    }
+    int32_t split_no = 0;
+    int kid_sn = gguf_find_key(init_gctx, "split.no");
+    if (kid_sn >= 0) {
+        split_no = gguf_get_val_u16(init_gctx, kid_sn);
+    }
+
+    std::vector<std::string> shard_paths;
+    if (split_count > 1) {
+        char prefix[1024];
+        int ret = llama_split_prefix(prefix, sizeof(prefix), gguf_path, split_no, split_count);
+        if (ret <= 0) {
+            fprintf(stderr, "[cache] FATAL: llama_split_prefix failed for %s\n", gguf_path);
+            abort();
+        }
+        for (int i = 0; i < split_count; i++) {
+            char spath[1024];
+            llama_split_path(spath, sizeof(spath), prefix, i, split_count);
+            shard_paths.push_back(spath);
+        }
+    } else {
+        shard_paths.push_back(gguf_path);
+    }
+
+    for (int i = 0; i < gguf_get_n_kv(init_gctx); i++) {
+        const char * key = gguf_get_key(init_gctx, i);
+        if (strstr(key, "expert_used_count")) {
+            st.expert_used_count = gguf_get_val_u32(init_gctx, i);
+            fprintf(stderr, "[cache] detected expert_used_count = %d from %s\n", st.expert_used_count, key);
+            break;
+        }
+    }
+
+    ggml_free(init_meta);
+    gguf_free(init_gctx);
+
+    std::vector<gguf_shard> shards;
+    shards.reserve(shard_paths.size());
+    for (const auto & sp : shard_paths) {
+        gguf_shard sh;
+        sh.path = sp;
+        sh.fd_direct = open(sp.c_str(), O_RDONLY | O_DIRECT);
+        if (sh.fd_direct < 0) {
+            fprintf(stderr, "[cache] FATAL: open(O_DIRECT) failed for %s: %s\n", sp.c_str(), strerror(errno));
+            abort();
+        }
+        st.shard_fds.push_back(sh.fd_direct);
+
+        struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &sh.meta_ctx };
+        sh.gctx = gguf_init_from_file(sp.c_str(), gp);
+        if (!sh.gctx) {
+            fprintf(stderr, "[cache] FATAL: gguf_init_from_file failed for %s\n", sp.c_str());
+            abort();
+        }
+        shards.push_back(sh);
+    }
+    st.fd_direct = shards[0].fd_direct;
+    fprintf(stderr, "[cache] Direct I/O initialized across %zu GGUF shard(s)\n", shards.size());
 
     st.layers.resize(n_layer);
     size_t max_row_bytes = 0;
@@ -862,8 +943,8 @@ static void setup_cache(cache_state & st, llama_model * model, const char * gguf
             lc.cache_size = lc.gate_up.gpu_tensor->ne[2];
             if (!lc.shrunk()) continue;
 
-            if (!describe_bank(gctx, meta_ctx, il, "ffn_gate_up_exps", lc.gate_up) ||
-                !describe_bank(gctx, meta_ctx, il, "ffn_down_exps",    lc.down)) {
+            if (!describe_bank(shards, il, "ffn_gate_up_exps", lc.gate_up) ||
+                !describe_bank(shards, il, "ffn_down_exps",    lc.down)) {
                 fprintf(stderr, "[cache] FATAL: could not describe fused expert banks for layer %d\n", il);
                 abort();
             }
@@ -877,17 +958,23 @@ static void setup_cache(cache_state & st, llama_model * model, const char * gguf
             lc.gate_up_scale.gpu_tensor = llama_model_get_tensor(model, gu_scale_name);
             lc.down_scale.gpu_tensor    = llama_model_get_tensor(model, dn_scale_name);
 
-            int64_t tid_gu = gguf_find_tensor(gctx, gu_scale_name);
-            if (tid_gu >= 0) {
-                size_t off = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid_gu);
-                lc.host_gate_up_scale.resize(lc.n_expert_real);
-                read_odirect(st.fd_direct, off, lc.n_expert_real * sizeof(float), (uint8_t *) lc.host_gate_up_scale.data());
+            for (const auto & sh : shards) {
+                int64_t tid_gu = gguf_find_tensor(sh.gctx, gu_scale_name);
+                if (tid_gu >= 0) {
+                    size_t off = gguf_get_data_offset(sh.gctx) + gguf_get_tensor_offset(sh.gctx, tid_gu);
+                    lc.host_gate_up_scale.resize(lc.n_expert_real);
+                    read_odirect(sh.fd_direct, off, lc.n_expert_real * sizeof(float), (uint8_t *) lc.host_gate_up_scale.data());
+                    break;
+                }
             }
-            int64_t tid_dn = gguf_find_tensor(gctx, dn_scale_name);
-            if (tid_dn >= 0) {
-                size_t off = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid_dn);
-                lc.host_down_scale.resize(lc.n_expert_real);
-                read_odirect(st.fd_direct, off, lc.n_expert_real * sizeof(float), (uint8_t *) lc.host_down_scale.data());
+            for (const auto & sh : shards) {
+                int64_t tid_dn = gguf_find_tensor(sh.gctx, dn_scale_name);
+                if (tid_dn >= 0) {
+                    size_t off = gguf_get_data_offset(sh.gctx) + gguf_get_tensor_offset(sh.gctx, tid_dn);
+                    lc.host_down_scale.resize(lc.n_expert_real);
+                    read_odirect(sh.fd_direct, off, lc.n_expert_real * sizeof(float), (uint8_t *) lc.host_down_scale.data());
+                    break;
+                }
             }
             if (lc.gate_up_scale.gpu_tensor && lc.down_scale.gpu_tensor) {
                 fprintf(stderr, "[cache] layer %d loaded NVFP4 scales (gpu_tensor size=%lld, host_scales=%zu, sample: gu=%.6f, dn=%.6f)\n",
@@ -911,9 +998,9 @@ static void setup_cache(cache_state & st, llama_model * model, const char * gguf
             lc.cache_size = lc.gate.gpu_tensor->ne[2];
             if (!lc.shrunk()) continue;
 
-            if (!describe_bank(gctx, meta_ctx, il, "ffn_gate_exps", lc.gate) ||
-                !describe_bank(gctx, meta_ctx, il, "ffn_up_exps",   lc.up)   ||
-                !describe_bank(gctx, meta_ctx, il, "ffn_down_exps", lc.down)) {
+            if (!describe_bank(shards, il, "ffn_gate_exps", lc.gate) ||
+                !describe_bank(shards, il, "ffn_up_exps",   lc.up)   ||
+                !describe_bank(shards, il, "ffn_down_exps", lc.down)) {
                 fprintf(stderr, "[cache] FATAL: could not describe expert banks for layer %d\n", il);
                 abort();
             }
@@ -974,41 +1061,12 @@ static void setup_cache(cache_state & st, llama_model * model, const char * gguf
 
     st.uring.init(128, max_row_bytes > 0 ? max_row_bytes : 589824);
 
-    ggml_free(meta_ctx);
-    gguf_free(gctx);
-}
-
-// Cross-check our GGUF-offset/row_bytes math against the model's OWN loaded (full,
-// unshrunk) tensor data for a CPU-placed layer, to rule out a bank/offset mismatch in
-// our own reader (as opposed to a self-consistency check against another read of the
-// same file, which Phase 2 already covered).
-static void cross_check_against_loaded_tensor(cache_state & st, llama_model * model, const char * gguf_path, int il, int expert_id) {
-    struct ggml_context * meta_ctx = nullptr;
-    struct gguf_init_params gp = { true, &meta_ctx };
-    struct gguf_context * gctx = gguf_init_from_file(gguf_path, gp);
-
-    expert_bank bank;
-    if (!describe_bank(gctx, meta_ctx, il, "ffn_gate_exps", bank)) {
-        fprintf(stderr, "[cross-check] FATAL: could not describe bank\n");
-        abort();
+    for (auto & sh : shards) {
+        ggml_free(sh.meta_ctx);
+        gguf_free(sh.gctx);
     }
-
-    std::vector<uint8_t> from_file(bank.row_bytes);
-    read_odirect(st.fd_direct, bank.base_offset + (size_t) expert_id * bank.row_bytes, bank.row_bytes, from_file.data());
-
-    char name[64];
-    snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", il);
-    ggml_tensor * loaded = llama_model_get_tensor(model, name);
-    std::vector<uint8_t> from_model(bank.row_bytes);
-    ggml_backend_tensor_get(loaded, from_model.data(), (size_t) expert_id * bank.row_bytes, bank.row_bytes);
-
-    bool match = memcmp(from_file.data(), from_model.data(), bank.row_bytes) == 0;
-    fprintf(stderr, "[cross-check] layer %d expert %d: our_odirect_read == model_loaded_tensor: %s\n",
-            il, expert_id, match ? "YES" : "NO");
-
-    ggml_free(meta_ctx);
-    gguf_free(gctx);
 }
+
 
 // Phase 4 calibration persistence: a trivial flat binary format (not nvmoe's torch.save,
 // no need for cross-language compat here) -- per-layer: n_expert_real int64 counts.
@@ -1076,7 +1134,8 @@ static void prewarm_cache(cache_state & st) {
         const char * gpu_pin_env = getenv("NVMOE_GPU_PINNED_EXPERTS");
         int64_t default_gpu_pin = std::min<int64_t>(16, lc.cache_size / 2);
         lc.gpu_pinned_k = gpu_pin_env ? atoi(gpu_pin_env) : default_gpu_pin;
-        if (lc.gpu_pinned_k > lc.cache_size - 10) lc.gpu_pinned_k = std::max<int32_t>(0, (int32_t)lc.cache_size - 10);
+        int32_t top_k = st.expert_used_count > 0 ? st.expert_used_count : 8;
+        if (lc.gpu_pinned_k > lc.cache_size - top_k) lc.gpu_pinned_k = std::max<int32_t>(0, (int32_t)lc.cache_size - top_k);
 
         std::vector<int32_t> ids_by_freq(lc.n_expert_real);
         for (int32_t i = 0; i < (int32_t) lc.n_expert_real; i++) {
@@ -1102,12 +1161,12 @@ static void prewarm_cache(cache_state & st) {
             }
 
             if (lc.fused_gate_up) {
-                prewarm_jobs.push_back({ lc.gate_up.base_offset + (size_t) real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(slot) });
-                prewarm_jobs.push_back({ lc.down.base_offset    + (size_t) real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(slot) });
+                prewarm_jobs.push_back({ lc.gate_up.fd_direct, lc.gate_up.base_offset + (size_t) real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(slot) });
+                prewarm_jobs.push_back({ lc.down.fd_direct,    lc.down.base_offset    + (size_t) real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(slot) });
             } else {
-                prewarm_jobs.push_back({ lc.gate.base_offset + (size_t) real_id * lc.gate.row_bytes, lc.gate.row_bytes, lc.host_gate.slot_ptr(slot) });
-                prewarm_jobs.push_back({ lc.up.base_offset   + (size_t) real_id * lc.up.row_bytes,   lc.up.row_bytes,   lc.host_up.slot_ptr(slot)   });
-                prewarm_jobs.push_back({ lc.down.base_offset + (size_t) real_id * lc.down.row_bytes, lc.down.row_bytes, lc.host_down.slot_ptr(slot) });
+                prewarm_jobs.push_back({ lc.gate.fd_direct, lc.gate.base_offset + (size_t) real_id * lc.gate.row_bytes, lc.gate.row_bytes, lc.host_gate.slot_ptr(slot) });
+                prewarm_jobs.push_back({ lc.up.fd_direct,   lc.up.base_offset   + (size_t) real_id * lc.up.row_bytes,   lc.up.row_bytes,   lc.host_up.slot_ptr(slot)   });
+                prewarm_jobs.push_back({ lc.down.fd_direct, lc.down.base_offset + (size_t) real_id * lc.down.row_bytes, lc.down.row_bytes, lc.host_down.slot_ptr(slot) });
             }
         }
         prewarmed_total += pinned_this_layer;
@@ -1176,10 +1235,154 @@ static void prewarm_cache(cache_state & st) {
     st.hits = st.misses = st.host_hits = st.host_misses = 0;
 }
 
+static std::mutex g_inference_mutex;
+
+struct generation_result {
+    std::string text;
+    int n_prompt = 0;
+    int n_decoded = 0;
+    double ttft = 0.0;
+    double decode_tok_s = 0.0;
+};
+
+static std::string format_chat_messages(const llama_model * model, const std::vector<std::pair<std::string, std::string>> & messages) {
+    std::vector<llama_chat_message> chat_msgs;
+    chat_msgs.reserve(messages.size());
+    for (const auto & m : messages) {
+        chat_msgs.push_back({ m.first.c_str(), m.second.c_str() });
+    }
+    const char * tmpl = llama_model_chat_template(model, nullptr);
+    if (tmpl) {
+        int32_t req_len = llama_chat_apply_template(tmpl, chat_msgs.data(), chat_msgs.size(), true, nullptr, 0);
+        if (req_len > 0) {
+            std::string buf(req_len + 1, '\0');
+            int32_t written = llama_chat_apply_template(tmpl, chat_msgs.data(), chat_msgs.size(), true, &buf[0], buf.size());
+            if (written > 0) {
+                buf.resize(written);
+                return buf;
+            }
+        }
+    }
+    std::string formatted;
+    for (const auto & m : messages) {
+        formatted += "<|im_start|>" + m.first + "\n" + m.second + "<|im_end|>\n";
+    }
+    formatted += "<|im_start|>assistant\n";
+    return formatted;
+}
+
+static bool run_inference_request(
+    cache_state & st,
+    llama_model * model,
+    llama_context * ctx,
+    const common_params & base_params,
+    const std::vector<llama_token> & prompt_tokens,
+    int max_tokens,
+    float temperature,
+    const std::function<bool(const std::string & chunk_text)> & on_token,
+    generation_result & res_out
+) {
+    std::lock_guard<std::mutex> lock(g_inference_mutex);
+
+    llama_memory_clear(llama_get_memory(ctx), false);
+
+    common_params req_params = base_params;
+    if (temperature >= 0.0f) {
+        req_params.sampling.temp = temperature;
+        if (temperature == 0.0f) {
+            req_params.sampling.top_k = 1;
+        }
+    }
+    common_sampler * smpl = common_sampler_init(model, req_params.sampling);
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    auto t_start = std::chrono::steady_clock::now();
+
+    st.is_decode_phase = false;
+    llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(prompt_tokens.data()), prompt_tokens.size());
+    if (llama_decode(ctx, batch) != 0) {
+        fprintf(stderr, "[server] prompt decode failed\n");
+        common_sampler_free(smpl);
+        return false;
+    }
+
+    auto t_prompt_done = std::chrono::steady_clock::now();
+    res_out.ttft = std::chrono::duration<double>(t_prompt_done - t_start).count();
+    res_out.n_prompt = (int) prompt_tokens.size();
+
+    st.is_decode_phase = true;
+    st.decode_hits = st.decode_misses = st.decode_host_hits = st.decode_host_misses = 0;
+
+    llama_token new_token = common_sampler_sample(smpl, ctx, -1);
+    common_sampler_accept(smpl, new_token, true);
+
+    int n_decoded = 0;
+    if (!llama_vocab_is_eog(vocab, new_token)) {
+        std::string piece = common_token_to_piece(ctx, new_token);
+        res_out.text += piece;
+        n_decoded = 1;
+        if (on_token && !on_token(piece)) {
+            common_sampler_free(smpl);
+            return true;
+        }
+    }
+
+    auto t_decode_start = std::chrono::steady_clock::now();
+    batch = llama_batch_get_one(&new_token, 1);
+
+    int max_allowed = std::min(max_tokens, (int) llama_n_ctx(ctx) - (int) prompt_tokens.size() - 2);
+    while (n_decoded < max_allowed) {
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "[server] decode step failed at token %d\n", n_decoded);
+            break;
+        }
+        llama_token next_token = common_sampler_sample(smpl, ctx, -1);
+        common_sampler_accept(smpl, next_token, true);
+        if (llama_vocab_is_eog(vocab, next_token)) {
+            break;
+        }
+        std::string piece = common_token_to_piece(ctx, next_token);
+        res_out.text += piece;
+        n_decoded++;
+        if (on_token && !on_token(piece)) {
+            break;
+        }
+        batch = llama_batch_get_one(&next_token, 1);
+    }
+
+    auto t_decode_end = std::chrono::steady_clock::now();
+    double decode_secs = std::chrono::duration<double>(t_decode_end - t_decode_start).count();
+    res_out.n_decoded = n_decoded;
+    res_out.decode_tok_s = (n_decoded > 1 && decode_secs > 0) ? (n_decoded - 1) / decode_secs : 0.0;
+
+    common_sampler_free(smpl);
+    return true;
+}
+
 int main(int argc, char ** argv) {
+    bool server_mode = false;
+    int server_port = 8080;
+    std::vector<char *> clean_argv;
+    clean_argv.push_back(argv[0]);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--server") == 0) {
+            server_mode = true;
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            server_port = atoi(argv[i + 1]);
+            server_mode = true;
+            i++;
+        } else {
+            clean_argv.push_back(argv[i]);
+        }
+    }
+
     common_params params;
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    int clean_argc = (int) clean_argv.size();
+    if (!common_params_parse(clean_argc, clean_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
+    }
+    if (params.n_gpu_layers < 0) {
+        params.n_gpu_layers = 999;
     }
 
     cache_state st;
@@ -1235,12 +1438,11 @@ int main(int argc, char ** argv) {
         }
     }
     if (min_cache > 0) {
-        // With top-10 routing, a batch of N tokens can require up to min(512, N*10) unique experts.
-        // Clamp n_ubatch so the worst-case active set comfortably fits within GPU cache_size.
-        int32_t safe_ubatch = std::max(1, (min_cache - 4) / 10);
+        int32_t top_k = st.expert_used_count > 0 ? st.expert_used_count : 8;
+        int32_t safe_ubatch = std::max(1, (min_cache - 4) / top_k);
         if (cparams.n_ubatch > safe_ubatch) {
-            fprintf(stderr, "[cache] auto-clamping n_ubatch from %d to %d (cache_size=%d, top-10 routing)\n",
-                    cparams.n_ubatch, safe_ubatch, min_cache);
+            fprintf(stderr, "[cache] auto-clamping n_ubatch from %d to %d (cache_size=%d, top-%d routing)\n",
+                    cparams.n_ubatch, safe_ubatch, min_cache, top_k);
             cparams.n_ubatch = safe_ubatch;
         }
     }
@@ -1250,6 +1452,180 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to create context\n");
         llama_model_free(model);
         return 1;
+    }
+
+    if (server_mode) {
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        fprintf(stderr, "\n============================================================================\n");
+        fprintf(stderr, "[server] Starting OpenAI-compatible HTTP server on http://0.0.0.0:%d\n", server_port);
+        fprintf(stderr, "[server] Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions\n");
+        fprintf(stderr, "============================================================================\n\n");
+
+        httplib::Server svr;
+
+        svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
+            res.set_content("{\"status\":\"ok\"}", "application/json");
+        });
+
+        svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
+            json j = {
+                {"object", "list"},
+                {"data", json::array({
+                    {
+                        {"id", "local"},
+                        {"object", "model"},
+                        {"created", (int64_t) time(nullptr)},
+                        {"owned_by", "nvmoe"}
+                    },
+                    {
+                        {"id", params.model.path},
+                        {"object", "model"},
+                        {"created", (int64_t) time(nullptr)},
+                        {"owned_by", "nvmoe"}
+                    }
+                })}
+            };
+            res.set_content(j.dump(), "application/json");
+        });
+
+        svr.Get("/models", [&](const httplib::Request &, httplib::Response & res) {
+            json j = {
+                {"object", "list"},
+                {"data", json::array({
+                    {
+                        {"id", "local"},
+                        {"object", "model"},
+                        {"created", (int64_t) time(nullptr)},
+                        {"owned_by", "nvmoe"}
+                    }
+                })}
+            };
+            res.set_content(j.dump(), "application/json");
+        });
+
+        auto handle_chat = [&](const httplib::Request & req, httplib::Response & res) {
+            json body;
+            try {
+                body = json::parse(req.body);
+            } catch (const std::exception & e) {
+                res.status = 400;
+                res.set_content(json({{"error", {{"message", std::string("JSON parse error: ") + e.what()}}}}).dump(), "application/json");
+                return;
+            }
+
+            std::vector<std::pair<std::string, std::string>> msgs;
+            if (body.contains("messages") && body["messages"].is_array()) {
+                for (const auto & m : body["messages"]) {
+                    msgs.push_back({ m.value("role", "user"), m.value("content", "") });
+                }
+            }
+            int max_tokens = body.value("max_tokens", 1024);
+            float temp = body.value("temperature", 0.0f);
+            bool stream = body.value("stream", false);
+
+            std::string prompt_str = format_chat_messages(model, msgs);
+            std::vector<llama_token> tokens = common_tokenize(vocab, prompt_str, true, true);
+            fprintf(stderr, "[server] Request: %zu msgs -> %zu tokens (max=%d, temp=%.2f, stream=%s)\n",
+                    msgs.size(), tokens.size(), max_tokens, temp, stream ? "true" : "false");
+
+            if (stream) {
+                res.set_chunked_content_provider(
+                    "text/event-stream",
+                    [&st, model, ctx, params, tokens, max_tokens, temp, freq_path](size_t offset, httplib::DataSink & sink) -> bool {
+                        if (offset > 0) return true;
+                        std::string cmpl_id = "chatcmpl-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+                        generation_result gres;
+
+                        run_inference_request(
+                            st, model, ctx, params, tokens, max_tokens, temp,
+                            [&](const std::string & piece) -> bool {
+                                json chunk = {
+                                    {"id", cmpl_id},
+                                    {"object", "chat.completion.chunk"},
+                                    {"created", (int64_t) time(nullptr)},
+                                    {"model", "local"},
+                                    {"choices", json::array({
+                                        {
+                                            {"index", 0},
+                                            {"delta", {{"content", piece}}},
+                                            {"finish_reason", nullptr}
+                                        }
+                                    })}
+                                };
+                                std::string sse = "data: " + chunk.dump() + "\n\n";
+                                return sink.write(sse.data(), sse.size());
+                            },
+                            gres
+                        );
+
+                        json final_chunk = {
+                            {"id", cmpl_id},
+                            {"object", "chat.completion.chunk"},
+                            {"created", (int64_t) time(nullptr)},
+                            {"model", "local"},
+                            {"choices", json::array({
+                                {
+                                    {"index", 0},
+                                    {"delta", json::object()},
+                                    {"finish_reason", "stop"}
+                                }
+                            })},
+                            {"usage", {
+                                {"prompt_tokens", gres.n_prompt},
+                                {"completion_tokens", gres.n_decoded},
+                                {"total_tokens", gres.n_prompt + gres.n_decoded}
+                            }}
+                        };
+                        std::string sse = "data: " + final_chunk.dump() + "\n\ndata: [DONE]\n\n";
+                        sink.write(sse.data(), sse.size());
+                        sink.done();
+
+                        if (freq_path) {
+                            save_decode_freq(st, freq_path);
+                        }
+
+                        fprintf(stderr, "[server] Finished: %d prompt tok, %d gen tok (TTFT=%.2fs, decode=%.2f tok/s)\n",
+                                gres.n_prompt, gres.n_decoded, gres.ttft, gres.decode_tok_s);
+                        return true;
+                    }
+                );
+            } else {
+                generation_result gres;
+                run_inference_request(st, model, ctx, params, tokens, max_tokens, temp, nullptr, gres);
+                json resp = {
+                    {"id", "chatcmpl-1"},
+                    {"object", "chat.completion"},
+                    {"created", (int64_t) time(nullptr)},
+                    {"model", "local"},
+                    {"choices", json::array({
+                        {
+                            {"index", 0},
+                            {"message", {{"role", "assistant"}, {"content", gres.text}}},
+                            {"finish_reason", "stop"}
+                        }
+                    })},
+                    {"usage", {
+                        {"prompt_tokens", gres.n_prompt},
+                        {"completion_tokens", gres.n_decoded},
+                        {"total_tokens", gres.n_prompt + gres.n_decoded}
+                    }}
+                };
+                if (freq_path) {
+                    save_decode_freq(st, freq_path);
+                }
+                res.set_content(resp.dump(), "application/json");
+            }
+        };
+
+        svr.Post("/v1/chat/completions", handle_chat);
+        svr.Post("/chat/completions", handle_chat);
+
+        svr.listen("0.0.0.0", server_port);
+
+        llama_free(ctx);
+        llama_model_free(model);
+        close(st.fd_direct);
+        return 0;
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);

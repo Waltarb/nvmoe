@@ -1,0 +1,1 @@
+{ "tier": "smoke", "category": "feature", "maxTurns": 3, "outputBudget": 1500, "timeoutSec": 1800 }

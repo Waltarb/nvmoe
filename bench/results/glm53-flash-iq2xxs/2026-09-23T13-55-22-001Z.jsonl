@@ -1,0 +1,1 @@
+{"config":"glm53-flash-iq2xxs","task":"02-slugify-feature","category":"feature","run":1,"solved":true,"hiddenPassed":11,"hiddenTotal":11,"specGreen":true,"tscOk":true,"turns":1,"formatErrors":0,"applyErrors":0,"stopReason":"spec_green","promptTokens":413,"outputTokens":213,"usageEstimated":false,"ttftMs":[181386],"decodeTokS":[2.08],"wallMs":284384}
