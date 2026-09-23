@@ -207,12 +207,17 @@ struct cache_state {
     long     host_hits = 0, host_misses = 0;
     long     decode_hits = 0, decode_misses = 0;
     long     decode_host_hits = 0, decode_host_misses = 0;
+    long     decode_pruned_nvme = 0;
+    float    prune_nvme_thresh = 0.0f;
+    int      prune_min_keep = 6;
+    float    prune_min_mass = 0.95f;
     std::vector<layer_cache> layers; // indexed by layer id parsed from tensor name
 
     uring_reader uring;
     cudaStream_t h2d_stream = nullptr;
     cudaEvent_t  h2d_event  = nullptr;
     int32_t *    pinned_ids = nullptr;
+    float *      pinned_weights = nullptr;
 
     cache_state() {
         int least_pri = 0, greatest_pri = 0;
@@ -220,8 +225,13 @@ struct cache_state {
         cudaStreamCreateWithPriority(&h2d_stream, cudaStreamNonBlocking, greatest_pri);
         cudaEventCreateWithFlags(&h2d_event, cudaEventDisableTiming);
         cudaHostAlloc((void **)&pinned_ids, 4096 * sizeof(int32_t), cudaHostAllocDefault);
+        cudaHostAlloc((void **)&pinned_weights, 4096 * sizeof(float), cudaHostAllocDefault);
     }
     ~cache_state() {
+        if (pinned_weights) {
+            cudaFreeHost(pinned_weights);
+            pinned_weights = nullptr;
+        }
         if (pinned_ids) {
             cudaFreeHost(pinned_ids);
             pinned_ids = nullptr;
@@ -436,6 +446,59 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     // is the full row stride (e.g. 256*4 = 1024 bytes), NOT contiguous (8*4 = 32 bytes).
     for (int64_t row = 0; row < n_tokens; row++) {
         ggml_backend_tensor_get(selected_experts, ids.data() + row * n_expert_used, row * selected_experts->nb[1], n_expert_used * sizeof(int32_t));
+    }
+
+    // Dynamic Opportunistic Zero-IO Expert Pruning (Decode Phase Only)
+    if (st->is_decode_phase && n_tokens == 1 && st->prune_nvme_thresh > 0.0f && t->data && st->pinned_weights) {
+        cudaMemcpy(st->pinned_weights, t->data, n_expert_used * sizeof(float), cudaMemcpyDeviceToHost);
+
+        float total_weight = 0.0f;
+        for (int64_t i = 0; i < n_expert_used; i++) {
+            total_weight += st->pinned_weights[i];
+        }
+
+        if (total_weight > 1e-6f) {
+            int32_t resident_real = -1;
+            for (int s = 0; s < lc.cache_size; s++) {
+                if (lc.real_in_slot[s] != -1) {
+                    resident_real = lc.real_in_slot[s];
+                    break;
+                }
+            }
+
+            if (resident_real != -1) {
+                float remaining_mass = 1.0f;
+                int kept_count = n_expert_used;
+                bool weights_modified = false;
+
+                for (int64_t k = n_expert_used - 1; k >= 0; k--) {
+                    if (kept_count <= st->prune_min_keep) {
+                        break;
+                    }
+                    int32_t real_id = ids[k];
+                    bool in_gpu  = (lc.slot_of_real[real_id] != -1);
+                    bool in_host = (lc.host_slot_of_real[real_id] != -1);
+
+                    // If neither in GPU nor in Host, fetching requires NVMe disk I/O
+                    if (!in_gpu && !in_host) {
+                        float rel_w = st->pinned_weights[k] / total_weight;
+                        if (rel_w < st->prune_nvme_thresh && (remaining_mass - rel_w) >= st->prune_min_mass) {
+                            st->pinned_weights[k] = 0.0f;
+                            ids[k] = resident_real;
+                            remaining_mass -= rel_w;
+                            kept_count--;
+                            weights_modified = true;
+                            st->decode_pruned_nvme++;
+                        }
+                    }
+                }
+
+                if (weights_modified) {
+                    cudaMemcpyAsync(t->data, st->pinned_weights, n_expert_used * sizeof(float),
+                                    cudaMemcpyHostToDevice, cudaStreamPerThread);
+                }
+            }
+        }
     }
 
     // Fetch every distinct real expert id used by this layer's routing before remapping
@@ -1125,6 +1188,17 @@ int main(int argc, char ** argv) {
     const char * host_cache_env = getenv("NVMOE_HOST_CACHE_SIZE");
     st.host_cache_size_cfg = host_cache_env ? atoi(host_cache_env) : st.cache_size_cfg * 4;
 
+    const char * prune_env = getenv("NVMOE_PRUNE_NVME_THRESH");
+    st.prune_nvme_thresh = prune_env ? atof(prune_env) : 0.0f;
+    const char * prune_keep_env = getenv("NVMOE_PRUNE_MIN_KEEP");
+    if (prune_keep_env) st.prune_min_keep = atoi(prune_keep_env);
+    const char * prune_mass_env = getenv("NVMOE_PRUNE_MIN_MASS");
+    if (prune_mass_env) st.prune_min_mass = atof(prune_mass_env);
+    if (st.prune_nvme_thresh > 0.0f) {
+        fprintf(stderr, "[prune] Zero-IO Tail Pruning enabled: thresh=%.4f (min_keep=%d, min_mass=%.3f)\n",
+                st.prune_nvme_thresh, st.prune_min_keep, st.prune_min_mass);
+    }
+
     llama_model_params mparams = common_model_params_to_llama(params);
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (!model) {
@@ -1311,6 +1385,9 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "Decode GPU VRAM Hits: %ld / %ld (%.1f%%, 0 ms PCIe transfer)\n", st.decode_hits, total_refs, gpu_hit_rate);
     fprintf(stderr, "Decode In-Memory Hits:%ld / %ld (%.1f%% RAM hit, %.1f%% NVMe read)\n",
             st.decode_host_hits, total_host_lookups, host_hit_rate, nvme_miss_rate);
+    if (st.decode_pruned_nvme > 0) {
+        fprintf(stderr, "Decode NVMe Pruned:   %ld tail misses skipped (Zero-IO dynamic pruning)\n", st.decode_pruned_nvme);
+    }
     fprintf(stderr, "Cumulative Stats:     callback_hits=%ld gpu_hits=%ld gpu_misses=%ld host_hits=%ld host_misses=%ld\n",
             st.callback_hits, st.hits, st.misses, st.host_hits, st.host_misses);
     fprintf(stderr, "============================================================================\n");
