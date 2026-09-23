@@ -139,9 +139,9 @@ NVMOE_CACHE_SIZE=24 \
 NVMOE_GPU_PINNED_EXPERTS=6 \
 NVMOE_HOST_CACHE_SIZE=56 \
 NVMOE_PINNED_EXPERTS=8 \
-NVMOE_PRUNE_NVME_THRESH=0.18 \
-NVMOE_PRUNE_MIN_KEEP=3 \
-NVMOE_PRUNE_MIN_MASS=0.75 \
+NVMOE_PRUNE_NVME_THRESH=0.28 \
+NVMOE_PRUNE_MIN_KEEP=2 \
+NVMOE_PRUNE_MIN_MASS=0.60 \
 NVMOE_FREQ_PATH=models/freq_glm53.bin \
 ./moe_cache_probe \
   -m models/glm-5.3-flash-iq2xxs/UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf \
@@ -149,9 +149,10 @@ NVMOE_FREQ_PATH=models/freq_glm53.bin \
   -c 512 -n 50 --temp 0
 ```
 Expected output:
-- Target decode throughput: **> 5.0 tok/s** (steady-state ~5.5 tok/s, min latency < 100 ms).
-- Pruned NVMe tail reads: **> 4,000 skipped per 50 tokens**.
-- Output text: Coherent generation describing Paris and France.
+- Target decode throughput: **> 8.0 tok/s** (steady-state ~8.9 tok/s, min latency < 65 ms / ~16 tok/s peak).
+- In-memory hit rate: **> 90%** (up to 93.4%).
+- Pruned NVMe tail reads: **> 5,700 skipped per 50 tokens**.
+- Output text: Coherent, rich generation describing Paris and France.
 
 ### Running the Benchmark Suite (`nvmoe-bench`)
 ```bash

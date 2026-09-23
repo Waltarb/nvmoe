@@ -468,54 +468,70 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
         ggml_backend_tensor_get(selected_experts, ids.data() + row * n_expert_used, row * selected_experts->nb[1], n_expert_used * sizeof(int32_t));
     }
 
-    // Dynamic Opportunistic Zero-IO Expert Pruning (Decode Phase Only)
-    if (st->is_decode_phase && n_tokens == 1 && st->prune_nvme_thresh > 0.0f && t->data && st->pinned_weights) {
-        cudaMemcpy(st->pinned_weights, t->data, n_expert_used * sizeof(float), cudaMemcpyDeviceToHost);
-
-        float total_weight = 0.0f;
-        for (int64_t i = 0; i < n_expert_used; i++) {
-            total_weight += st->pinned_weights[i];
+    // Dynamic Opportunistic Zero-IO Expert Pruning (Prefill & Decode)
+    if (st->prune_nvme_thresh > 0.0f && t->data && st->pinned_weights && (n_tokens * n_expert_used <= 4096)) {
+        int32_t resident_real = -1;
+        for (int s = 0; s < lc.cache_size; s++) {
+            if (lc.real_in_slot[s] != -1) {
+                resident_real = lc.real_in_slot[s];
+                break;
+            }
         }
 
-        if (total_weight > 1e-6f) {
-            int32_t resident_real = -1;
-            for (int s = 0; s < lc.cache_size; s++) {
-                if (lc.real_in_slot[s] != -1) {
-                    resident_real = lc.real_in_slot[s];
-                    break;
+        if (resident_real != -1) {
+            for (int64_t row = 0; row < n_tokens; row++) {
+                float * row_weights = st->pinned_weights + row * n_expert_used;
+                int32_t * row_ids = ids.data() + row * n_expert_used;
+                char * dev_w_ptr = (char *) t->data + (n_tokens == 1 ? 0 : row * t->nb[2]);
+
+                cudaMemcpy(row_weights, dev_w_ptr, n_expert_used * sizeof(float), cudaMemcpyDeviceToHost);
+
+                float total_weight = 0.0f;
+                for (int64_t i = 0; i < n_expert_used; i++) {
+                    total_weight += row_weights[i];
                 }
-            }
 
-            if (resident_real != -1) {
-                float remaining_mass = 1.0f;
-                int kept_count = n_expert_used;
-                bool weights_modified = false;
+                if (total_weight > 1e-6f) {
+                    float remaining_mass = 1.0f;
+                    int kept_count = n_expert_used;
+                    bool weights_modified = false;
 
-                for (int64_t k = n_expert_used - 1; k >= 0; k--) {
-                    if (kept_count <= st->prune_min_keep) {
-                        break;
-                    }
-                    int32_t real_id = ids[k];
-                    bool in_gpu  = (lc.slot_of_real[real_id] != -1);
-                    bool in_host = (lc.host_slot_of_real[real_id] != -1);
+                    for (int64_t k = n_expert_used - 1; k >= 0; k--) {
+                        if (kept_count <= st->prune_min_keep) {
+                            break;
+                        }
+                        int32_t real_id = row_ids[k];
+                        bool in_gpu  = (lc.slot_of_real[real_id] != -1);
+                        bool in_host = (lc.host_slot_of_real[real_id] != -1);
 
-                    // If neither in GPU nor in Host, fetching requires NVMe disk I/O
-                    if (!in_gpu && !in_host) {
-                        float rel_w = st->pinned_weights[k] / total_weight;
-                        if (rel_w < st->prune_nvme_thresh && (remaining_mass - rel_w) >= st->prune_min_mass) {
-                            st->pinned_weights[k] = 0.0f;
-                            ids[k] = resident_real;
-                            remaining_mass -= rel_w;
-                            kept_count--;
-                            weights_modified = true;
-                            st->decode_pruned_nvme++;
+                        // If neither in GPU nor in Host, fetching requires NVMe disk I/O
+                        if (!in_gpu && !in_host) {
+                            float rel_w = row_weights[k] / total_weight;
+                            if (rel_w < st->prune_nvme_thresh && (remaining_mass - rel_w) >= st->prune_min_mass) {
+                                row_weights[k] = 0.0f;
+                                row_ids[k] = resident_real;
+                                remaining_mass -= rel_w;
+                                kept_count--;
+                                weights_modified = true;
+                                if (st->is_decode_phase) st->decode_pruned_nvme++;
+                            }
                         }
                     }
-                }
 
-                if (weights_modified) {
-                    cudaMemcpyAsync(t->data, st->pinned_weights, n_expert_used * sizeof(float),
-                                    cudaMemcpyHostToDevice, cudaStreamPerThread);
+                    if (weights_modified) {
+                        float new_total = 0.0f;
+                        for (int64_t i = 0; i < n_expert_used; i++) {
+                            new_total += row_weights[i];
+                        }
+                        if (new_total > 1e-6f) {
+                            float renorm_factor = total_weight / new_total;
+                            for (int64_t i = 0; i < n_expert_used; i++) {
+                                row_weights[i] *= renorm_factor;
+                            }
+                        }
+                        cudaMemcpyAsync(dev_w_ptr, row_weights, n_expert_used * sizeof(float),
+                                        cudaMemcpyHostToDevice, cudaStreamPerThread);
+                    }
                 }
             }
         }
@@ -673,6 +689,14 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 
     // --- Step 3: Pipelined NVMe reads + instant H2D dispatch per completed expert ---
     if (!nvme_tasks.empty()) {
+        enum class subjob_bank_type {
+            FUSED_GATE_UP,
+            FUSED_DOWN,
+            GATE,
+            UP,
+            DOWN
+        };
+
         struct nvme_subjob {
             int fd;
             size_t offset;
@@ -680,37 +704,47 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
             uint8_t * out;
             size_t staging_idx;
             nvme_expert_task * task;
+            subjob_bank_type btype;
         };
         std::vector<nvme_subjob> subjobs;
         subjobs.reserve(nvme_tasks.size() * (lc.fused_gate_up ? 2 : 3));
 
         for (auto & t : nvme_tasks) {
             if (lc.fused_gate_up) {
-                subjobs.push_back({ lc.gate_up.fd_direct, lc.gate_up.base_offset + (size_t) t.real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(t.host_slot), 0, &t });
-                subjobs.push_back({ lc.down.fd_direct,    lc.down.base_offset    + (size_t) t.real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(t.host_slot),    0, &t });
+                subjobs.push_back({ lc.gate_up.fd_direct, lc.gate_up.base_offset + (size_t) t.real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(t.host_slot), 0, &t, subjob_bank_type::FUSED_GATE_UP });
+                subjobs.push_back({ lc.down.fd_direct,    lc.down.base_offset    + (size_t) t.real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(t.host_slot),    0, &t, subjob_bank_type::FUSED_DOWN });
             } else {
-                subjobs.push_back({ lc.gate.fd_direct, lc.gate.base_offset + (size_t) t.real_id * lc.gate.row_bytes, lc.gate.row_bytes, lc.host_gate.slot_ptr(t.host_slot), 0, &t });
-                subjobs.push_back({ lc.up.fd_direct,   lc.up.base_offset   + (size_t) t.real_id * lc.up.row_bytes,   lc.up.row_bytes,   lc.host_up.slot_ptr(t.host_slot),   0, &t });
-                subjobs.push_back({ lc.down.fd_direct, lc.down.base_offset + (size_t) t.real_id * lc.down.row_bytes, lc.down.row_bytes, lc.host_down.slot_ptr(t.host_slot), 0, &t });
+                subjobs.push_back({ lc.gate.fd_direct, lc.gate.base_offset + (size_t) t.real_id * lc.gate.row_bytes, lc.gate.row_bytes, lc.host_gate.slot_ptr(t.host_slot), 0, &t, subjob_bank_type::GATE });
+                subjobs.push_back({ lc.up.fd_direct,   lc.up.base_offset   + (size_t) t.real_id * lc.up.row_bytes,   lc.up.row_bytes,   lc.host_up.slot_ptr(t.host_slot),   0, &t, subjob_bank_type::UP });
+                subjobs.push_back({ lc.down.fd_direct, lc.down.base_offset + (size_t) t.real_id * lc.down.row_bytes, lc.down.row_bytes, lc.host_down.slot_ptr(t.host_slot), 0, &t, subjob_bank_type::DOWN });
             }
         }
 
-        auto dispatch_expert_to_gpu = [&](nvme_expert_task * t) {
-            if (lc.fused_gate_up) {
-                gpu_fill_from_host_async(*st, lc, lc.gate_up, lc.host_gate_up, t->gpu_slot, t->host_slot, t->real_id);
-                gpu_fill_from_host_async(*st, lc, lc.down,    lc.host_down,    t->gpu_slot, t->host_slot, t->real_id);
-                if (lc.gate_up_scale.gpu_tensor && !lc.host_gate_up_scale.empty()) {
-                    cudaMemcpyAsync((char *) lc.gate_up_scale.gpu_tensor->data + (size_t) t->gpu_slot * sizeof(float),
-                                    &lc.host_gate_up_scale[t->real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
-                }
-                if (lc.down_scale.gpu_tensor && !lc.host_down_scale.empty()) {
-                    cudaMemcpyAsync((char *) lc.down_scale.gpu_tensor->data + (size_t) t->gpu_slot * sizeof(float),
-                                    &lc.host_down_scale[t->real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
-                }
-            } else {
-                gpu_fill_from_host_async(*st, lc, lc.gate, lc.host_gate, t->gpu_slot, t->host_slot, t->real_id);
-                gpu_fill_from_host_async(*st, lc, lc.up,   lc.host_up,   t->gpu_slot, t->host_slot, t->real_id);
-                gpu_fill_from_host_async(*st, lc, lc.down, lc.host_down, t->gpu_slot, t->host_slot, t->real_id);
+        auto dispatch_bank_to_gpu = [&](const nvme_subjob & sj) {
+            switch (sj.btype) {
+                case subjob_bank_type::GATE:
+                    gpu_fill_from_host_async(*st, lc, lc.gate, lc.host_gate, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
+                    break;
+                case subjob_bank_type::UP:
+                    gpu_fill_from_host_async(*st, lc, lc.up, lc.host_up, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
+                    break;
+                case subjob_bank_type::DOWN:
+                    gpu_fill_from_host_async(*st, lc, lc.down, lc.host_down, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
+                    break;
+                case subjob_bank_type::FUSED_GATE_UP:
+                    gpu_fill_from_host_async(*st, lc, lc.gate_up, lc.host_gate_up, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
+                    if (lc.gate_up_scale.gpu_tensor && !lc.host_gate_up_scale.empty()) {
+                        cudaMemcpyAsync((char *) lc.gate_up_scale.gpu_tensor->data + (size_t) sj.task->gpu_slot * sizeof(float),
+                                        &lc.host_gate_up_scale[sj.task->real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
+                    }
+                    break;
+                case subjob_bank_type::FUSED_DOWN:
+                    gpu_fill_from_host_async(*st, lc, lc.down, lc.host_down, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
+                    if (lc.down_scale.gpu_tensor && !lc.host_down_scale.empty()) {
+                        cudaMemcpyAsync((char *) lc.down_scale.gpu_tensor->data + (size_t) sj.task->gpu_slot * sizeof(float),
+                                        &lc.host_down_scale[sj.task->real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
+                    }
+                    break;
             }
             any_gpu_fill = true;
         };
@@ -721,10 +755,7 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                     fprintf(stderr, "[cache] FATAL: read_odirect failed\n");
                     abort();
                 }
-                sj.task->completed_banks++;
-                if (sj.task->completed_banks == sj.task->total_banks) {
-                    dispatch_expert_to_gpu(sj.task);
-                }
+                dispatch_bank_to_gpu(sj);
             }
         } else {
             size_t total = subjobs.size();
@@ -768,10 +799,7 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                         abort();
                     }
                     memcpy(sj->out, st->uring.staging_buffers[sj->staging_idx] + front_pad, sj->len);
-                    sj->task->completed_banks++;
-                    if (sj->task->completed_banks == sj->task->total_banks) {
-                        dispatch_expert_to_gpu(sj->task);
-                    }
+                    dispatch_bank_to_gpu(*sj);
                 }
             }
         }
