@@ -212,12 +212,20 @@ struct cache_state {
     uring_reader uring;
     cudaStream_t h2d_stream = nullptr;
     cudaEvent_t  h2d_event  = nullptr;
+    int32_t *    pinned_ids = nullptr;
 
     cache_state() {
-        cudaStreamCreate(&h2d_stream);
+        int least_pri = 0, greatest_pri = 0;
+        cudaDeviceGetStreamPriorityRange(&least_pri, &greatest_pri);
+        cudaStreamCreateWithPriority(&h2d_stream, cudaStreamNonBlocking, greatest_pri);
         cudaEventCreateWithFlags(&h2d_event, cudaEventDisableTiming);
+        cudaHostAlloc((void **)&pinned_ids, 4096 * sizeof(int32_t), cudaHostAllocDefault);
     }
     ~cache_state() {
+        if (pinned_ids) {
+            cudaFreeHost(pinned_ids);
+            pinned_ids = nullptr;
+        }
         if (h2d_event) {
             cudaEventDestroy(h2d_event);
             h2d_event = nullptr;
@@ -702,8 +710,20 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
-    for (int64_t row = 0; row < n_tokens; row++) {
-        ggml_backend_tensor_set(selected_experts, ids.data() + row * n_expert_used, row * selected_experts->nb[1], n_expert_used * sizeof(int32_t));
+    if (st->pinned_ids && selected_experts->data) {
+        char * dev_dst = (char *) selected_experts->data;
+        for (int64_t row = 0; row < n_tokens; row++) {
+            memcpy(st->pinned_ids + row * n_expert_used, ids.data() + row * n_expert_used, n_expert_used * sizeof(int32_t));
+            cudaMemcpyAsync(dev_dst + row * selected_experts->nb[1],
+                            st->pinned_ids + row * n_expert_used,
+                            n_expert_used * sizeof(int32_t),
+                            cudaMemcpyHostToDevice,
+                            cudaStreamPerThread);
+        }
+    } else {
+        for (int64_t row = 0; row < n_tokens; row++) {
+            ggml_backend_tensor_set(selected_experts, ids.data() + row * n_expert_used, row * selected_experts->nb[1], n_expert_used * sizeof(int32_t));
+        }
     }
 
     if (any_gpu_fill) {
