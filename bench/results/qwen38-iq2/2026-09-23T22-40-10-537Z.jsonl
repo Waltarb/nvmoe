@@ -1,0 +1,1 @@
+{"config":"qwen38-iq2","task":"06-async-batch-scheduler","category":"concurrency","run":1,"solved":true,"hiddenPassed":8,"hiddenTotal":8,"specGreen":true,"tscOk":true,"turns":1,"formatErrors":0,"applyErrors":0,"stopReason":"spec_green","promptTokens":1474,"outputTokens":2500,"usageEstimated":false,"ttftMs":[18488],"decodeTokS":[31.61],"wallMs":98028}

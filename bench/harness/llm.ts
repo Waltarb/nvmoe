@@ -16,6 +16,11 @@ const API_KEY = process.env.BENCH_API_KEY ?? "none";
 const EXTRA = JSON.parse(process.env.BENCH_EXTRA_BODY ?? "{}");
 
 import { Agent } from "undici";
+import { writeFileSync, appendFileSync } from "node:fs";
+import { join } from "node:path";
+import { BENCH_ROOT } from "./util.ts";
+
+const LIVE_STREAM_FILE = join(BENCH_ROOT, ".live_stream.txt");
 
 const agent = new Agent({
   headersTimeout: 0,
@@ -26,7 +31,8 @@ const agent = new Agent({
 export async function chat(messages: Msg[], maxTokens: number, timeoutMs: number): Promise<ChatResult> {
   const t0 = performance.now();
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const timer = (timeoutMs > 0 && Number.isFinite(timeoutMs)) ? setTimeout(() => ctrl.abort(), timeoutMs) : undefined;
+  try { writeFileSync(LIVE_STREAM_FILE, ""); } catch {}
   let ttft = -1;
   let text = "";
   let reasoningChars = 0;
@@ -66,10 +72,19 @@ export async function chat(messages: Msg[], maxTokens: number, timeoutMs: number
         if ((piece || reasoning) && ttft < 0) ttft = performance.now() - t0;
         text += piece;
         reasoningChars += reasoning.length;
+        if (piece || reasoning) {
+          try { appendFileSync(LIVE_STREAM_FILE, piece || reasoning); } catch {}
+        }
       }
     }
+  } catch (err: any) {
+    if (err?.name === "AbortError" && text.length > 0) {
+      console.warn("  [warn] Stream aborted by timeout, preserving partial response");
+    } else {
+      throw err;
+    }
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 
   const totalMs = performance.now() - t0;

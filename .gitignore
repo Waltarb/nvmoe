@@ -6,12 +6,14 @@ models/*.bin
 !models/freq_qwen38.bin
 !models/freq_glm53.bin
 models/glm-5.3-flash-iq2xxs/
+models/qwen-3.8-flash-unsloth/
 
 # Binaries and compiled targets
 moe_cache_probe
 test_sched_chain_shrink
 scripts/repack_nvfp4_gguf
 repack_nvfp4_gguf
+repack_unsloth_interleaved
 *.o
 *.so
 *.a

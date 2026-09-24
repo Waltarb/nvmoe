@@ -104,10 +104,10 @@ For Qwen3.8-Flash-Next-NVFP4:
 ### Quick Rebuild of `moe_cache_probe`
 ```bash
 g++ -std=c++17 -O3 \
-    -I llama.cpp/include -I llama.cpp/common -I llama.cpp/ggml/include -I llama.cpp/src -I llama.cpp/vendor -I /opt/cuda/include \
+    -I llama.cpp/include -I llama.cpp/common -I llama.cpp/ggml/include -I llama.cpp/ggml/src -I llama.cpp/src -I llama.cpp/vendor -I /opt/cuda/include \
     scripts/moe_cache_probe.cpp \
     -L llama.cpp/build/bin -L /opt/cuda/lib64 \
-    -lllama -lllama-common -lggml -lggml-base -lcudart -luring \
+    -lllama -lllama-common -lggml -lggml-base -lggml-cuda -lcudart -luring \
     -Wl,-rpath,'$ORIGIN/llama.cpp/build/bin' \
     -Wl,-rpath,/home/waltarb/nvmoe-llamacpp/llama.cpp/build/bin \
     -Wl,-rpath,/opt/cuda/lib64 \
@@ -154,16 +154,17 @@ Expected output:
 - Pruned NVMe tail reads: **> 5,700 skipped per 50 tokens**.
 - Output text: Coherent, rich generation describing Paris and France.
 
-### Standard Verification Run (Qwen3.8-Flash-Next Unsloth UD-Q2_K_XL / IQ2)
+### Standard Verification Run (Qwen3.8-Flash-Next Unsloth UD-Q2_K_XL / IQ2 - High Throughput)
 ```bash
 GGML_CUDA_DISABLE_GRAPHS=1 \
-NVMOE_CACHE_SIZE=36 \
-NVMOE_GPU_PINNED_EXPERTS=16 \
-NVMOE_HOST_CACHE_SIZE=96 \
-NVMOE_PINNED_EXPERTS=32 \
-NVMOE_PRUNE_NVME_THRESH=0.28 \
+NVMOE_CACHE_SIZE=108 \
+NVMOE_GPU_PINNED_EXPERTS=64 \
+NVMOE_HOST_CACHE_SIZE=168 \
+NVMOE_PINNED_EXPERTS=120 \
+NVMOE_PRUNE_NVME_THRESH=0.45 \
+NVMOE_PRUNE_HOST_THRESH=0.04 \
 NVMOE_PRUNE_MIN_KEEP=2 \
-NVMOE_PRUNE_MIN_MASS=0.60 \
+NVMOE_PRUNE_MIN_MASS=0.45 \
 NVMOE_FREQ_PATH=models/freq_qwen38.bin \
 ./moe_cache_probe \
   -m models/qwen-3.8-flash-unsloth/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf \
@@ -171,11 +172,13 @@ NVMOE_FREQ_PATH=models/freq_qwen38.bin \
   -c 512 -n 50 --temp 0
 ```
 Expected output:
-- Target decode throughput: **> 14.0 tok/s** (steady-state ~15.3 tok/s, min latency < 45 ms / ~23 tok/s peak).
-- Prefill TTFT: **> 16.0 tok/s**.
-- In-memory hit rate: **> 80%**.
-- VRAM footprint: **< 7.0 GiB** (CUDA model buffer 6.46 GiB).
-- Output text: Coherent generation describing Paris and the Eiffel Tower.
+- Target decode throughput: **> 23.0 – 25.0 tok/s** (steady-state ~24.9 tok/s, min latency < 28 ms / **~36.3 tok/s peak**).
+- Prefill TTFT: **> 23.0 – 26.0 tok/s** (< 0.85s).
+- GPU VRAM hit rate: **> 92%** (zero PCIe transfer).
+- In-memory RAM hit rate: **> 75%**.
+- VRAM footprint: **12.64 GiB** (< 14 GiB safety hard cap).
+- Host RAM footprint: **~15.1 GiB** (< 20 GiB safety hard cap).
+- Output text: Coherent generation correctly reasoning and identifying Paris and the Eiffel Tower.
 
 ### Running the Benchmark Suite (`nvmoe-bench`)
 ```bash

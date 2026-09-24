@@ -1,0 +1,1 @@
+{ "tier": "core", "category": "ast", "maxTurns": 3, "outputBudget": 4000, "timeoutSec": 900 }

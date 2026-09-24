@@ -1,0 +1,1 @@
+{"config":"qwen38-nvfp4","task":"01-paginate-bugfix","category":"bugfix","run":1,"solved":true,"hiddenPassed":7,"hiddenTotal":7,"specGreen":true,"tscOk":true,"turns":1,"formatErrors":0,"applyErrors":0,"stopReason":"spec_green","promptTokens":663,"outputTokens":470,"usageEstimated":false,"ttftMs":[66223],"decodeTokS":[5.35],"wallMs":154939}

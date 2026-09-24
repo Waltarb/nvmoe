@@ -1,0 +1,1 @@
+{"config":"qwen38-nvfp4","task":"06-async-batch-scheduler","category":"concurrency","run":1,"solved":true,"hiddenPassed":8,"hiddenTotal":8,"specGreen":true,"tscOk":true,"turns":1,"formatErrors":0,"applyErrors":0,"stopReason":"spec_green","promptTokens":1506,"outputTokens":1429,"usageEstimated":false,"ttftMs":[199190],"decodeTokS":[6.42],"wallMs":422206}

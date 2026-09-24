@@ -5,10 +5,15 @@ export function summarize(rs: TaskResult[]) {
   const solved = rs.filter((r) => r.solved);
   const out = rs.reduce((s, r) => s + r.outputTokens, 0);
   const hiddenPassed = rs.reduce((s, r) => s + r.hiddenPassed, 0);
+  const hiddenTotal = rs.reduce((s, r) => s + r.hiddenTotal, 0);
+  const score100 = +((solved.length / Math.max(1, rs.length)) * 100).toFixed(1);
+  const hiddenPct = +((hiddenPassed / Math.max(1, hiddenTotal)) * 100).toFixed(1);
   return {
     config: rs[0]?.config ?? "?",
     runs: rs.length,
-    passRate: `${((solved.length / Math.max(1, rs.length)) * 100).toFixed(0)}%`,
+    score100,
+    hiddenPct: `${hiddenPct}%`,
+    passRate: `${score100.toFixed(0)}%`,
     solved: `${solved.length}/${rs.length}`,
     medWallSolvedMin: +(median(solved.map((r) => r.wallMs)) / 60000).toFixed(1),
     testsPer1kOut: +((hiddenPassed / Math.max(1, out)) * 1000).toFixed(2),

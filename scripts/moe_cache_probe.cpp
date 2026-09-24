@@ -19,7 +19,10 @@
 #include "arg.h"
 #include "sampling.h"
 #include "llama.h"
+#include "llama-context.h"
 #include "ggml-backend.h"
+#include "ggml-backend-impl.h"
+#include "ggml-cuda.h"
 #include "gguf.h"
 #include "segmented_host_lru.hpp"
 
@@ -178,6 +181,29 @@ struct host_bank_pool {
     uint8_t * slot_ptr(int32_t slot) { return data + (size_t) slot * row_bytes; }
 };
 
+#pragma pack(push, 1)
+struct layer_meta {
+    uint64_t file_offset;     // offset of expert 0 for this layer
+    uint32_t expert_size;     // total 4096-aligned bytes per expert
+    uint32_t gate_row_bytes;  // gate bytes
+    uint32_t up_row_bytes;    // up bytes
+    uint32_t down_row_bytes;  // down bytes
+    uint32_t pad_bytes;       // padding bytes
+};
+
+struct nvmoe_repack_header {
+    uint64_t magic;         // 0x4e564d4f4552504b ("NVMOERPK")
+    uint32_t version;       // 1
+    uint32_t n_layers;      // 48
+    uint32_t n_experts;     // 512
+    uint32_t reserved;      // 0
+    layer_meta layers[64];
+    uint8_t padding[4096 - (24 + 64 * sizeof(layer_meta))];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(nvmoe_repack_header) == 4096, "Header must be exactly 4096 bytes");
+
 struct layer_cache {
     int64_t n_expert_real = 0;
     int64_t cache_size    = 0; // == gpu_tensor->ne[2] if shrunk; == n_expert_real if not
@@ -203,6 +229,7 @@ struct layer_cache {
     int32_t host_next_free = 0;             // slots < this have been used at least once
     host_bank_pool host_gate_up;
     host_bank_pool host_gate, host_up, host_down;
+    host_bank_pool host_interleaved;
 
     // Phase 4 calibration: per-expert decode-hit counters (every time this layer needed
     // this real expert, hit or miss), and the set of experts prewarm-pinned into the host
@@ -220,12 +247,17 @@ struct cache_state {
     int      cache_size_cfg = 0;
     int      host_cache_size_cfg = 0;
     int      fd_direct = -1;
+    int      interleaved_fd = -1;
+    bool     has_interleaved = false;
+    nvmoe_repack_header interleaved_hdr;
     long     hits = 0, misses = 0, callback_hits = 0;
     long     host_hits = 0, host_misses = 0;
     long     decode_hits = 0, decode_misses = 0;
     long     decode_host_hits = 0, decode_host_misses = 0;
     long     decode_pruned_nvme = 0;
+    long     decode_pruned_host = 0;
     float    prune_nvme_thresh = 0.0f;
+    float    prune_host_thresh = 0.0f;
     int      prune_min_keep = 6;
     float    prune_min_mass = 0.95f;
     int      expert_used_count = 8;
@@ -234,6 +266,8 @@ struct cache_state {
     uring_reader uring;
     cudaStream_t h2d_stream = nullptr;
     cudaEvent_t  h2d_event  = nullptr;
+    ggml_backend_t cuda_backend = nullptr;
+    ggml_backend_event_t ggml_h2d_event = nullptr;
     int32_t *    pinned_ids = nullptr;
     float *      pinned_weights = nullptr;
 
@@ -254,6 +288,10 @@ struct cache_state {
             cudaFreeHost(pinned_ids);
             pinned_ids = nullptr;
         }
+        if (ggml_h2d_event) {
+            ggml_backend_event_free(ggml_h2d_event);
+            ggml_h2d_event = nullptr;
+        }
         if (h2d_event) {
             cudaEventDestroy(h2d_event);
             h2d_event = nullptr;
@@ -261,6 +299,10 @@ struct cache_state {
         if (h2d_stream) {
             cudaStreamDestroy(h2d_stream);
             h2d_stream = nullptr;
+        }
+        if (interleaved_fd >= 0) {
+            close(interleaved_fd);
+            interleaved_fd = -1;
         }
         for (int fd : shard_fds) {
             if (fd >= 0) close(fd);
@@ -293,12 +335,16 @@ static bool read_jobs_batch(cache_state & st, const std::vector<read_job> & jobs
         size_t batch_size = std::min(total - start, st.uring.max_batch);
         for (size_t i = 0; i < batch_size; i++) {
             const auto & j = jobs[start + i];
-            size_t aligned_off = align_down(j.offset);
-            size_t front_pad   = j.offset - aligned_off;
-            size_t aligned_len  = align_up(front_pad + j.len);
-
+            bool is_direct = (j.offset % 4096 == 0) && ((uintptr_t)j.out % 4096 == 0) && (j.len % 4096 == 0);
             io_uring_sqe * sqe = io_uring_get_sqe(&st.uring.ring);
-            io_uring_prep_read(sqe, j.fd, st.uring.staging_buffers[i], aligned_len, aligned_off);
+            if (is_direct) {
+                io_uring_prep_read(sqe, j.fd, j.out, j.len, j.offset);
+            } else {
+                size_t aligned_off = align_down(j.offset);
+                size_t front_pad   = j.offset - aligned_off;
+                size_t aligned_len  = align_up(front_pad + j.len);
+                io_uring_prep_read(sqe, j.fd, st.uring.staging_buffers[i], aligned_len, aligned_off);
+            }
             io_uring_sqe_set_data64(sqe, i);
         }
 
@@ -314,10 +360,15 @@ static bool read_jobs_batch(cache_state & st, const std::vector<read_job> & jobs
             io_uring_cqe_seen(&st.uring.ring, cqe);
 
             const auto & j = jobs[start + idx];
-            size_t aligned_off = align_down(j.offset);
-            size_t front_pad   = j.offset - aligned_off;
-            if (res < 0 || (size_t) res < front_pad + j.len) return false;
-            memcpy(j.out, st.uring.staging_buffers[idx] + front_pad, j.len);
+            bool is_direct = (j.offset % 4096 == 0) && ((uintptr_t)j.out % 4096 == 0) && (j.len % 4096 == 0);
+            if (is_direct) {
+                if (res < 0 || (size_t) res < j.len) return false;
+            } else {
+                size_t aligned_off = align_down(j.offset);
+                size_t front_pad   = j.offset - aligned_off;
+                if (res < 0 || (size_t) res < front_pad + j.len) return false;
+                memcpy(j.out, st.uring.staging_buffers[idx] + front_pad, j.len);
+            }
         }
     }
     return true;
@@ -468,7 +519,7 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
         ggml_backend_tensor_get(selected_experts, ids.data() + row * n_expert_used, row * selected_experts->nb[1], n_expert_used * sizeof(int32_t));
     }
 
-    // Dynamic Opportunistic Zero-IO Expert Pruning (Prefill & Decode)
+    // Dynamic Opportunistic Two-Tier Cost-Aware Expert Pruning (Prefill & Decode)
     if (st->prune_nvme_thresh > 0.0f && t->data && st->pinned_weights && (n_tokens * n_expert_used <= 4096)) {
         int32_t resident_real = -1;
         for (int s = 0; s < lc.cache_size; s++) {
@@ -492,6 +543,21 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                 }
 
                 if (total_weight > 1e-6f) {
+                    int32_t row_gpu_resident = -1;
+                    float in_mem_mass = 0.0f;
+                    for (int64_t i = 0; i < n_expert_used; i++) {
+                        int32_t rid = row_ids[i];
+                        bool in_gpu  = (lc.slot_of_real[rid] != -1);
+                        bool in_host = (lc.host_slot_of_real[rid] != -1);
+                        if (in_gpu && row_gpu_resident == -1) {
+                            row_gpu_resident = rid;
+                        }
+                        if (in_gpu || in_host) {
+                            in_mem_mass += (row_weights[i] / total_weight);
+                        }
+                    }
+                    int32_t alias_target = (row_gpu_resident != -1) ? row_gpu_resident : resident_real;
+
                     float remaining_mass = 1.0f;
                     int kept_count = n_expert_used;
                     bool weights_modified = false;
@@ -504,17 +570,38 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                         bool in_gpu  = (lc.slot_of_real[real_id] != -1);
                         bool in_host = (lc.host_slot_of_real[real_id] != -1);
 
-                        // If neither in GPU nor in Host, fetching requires NVMe disk I/O
-                        if (!in_gpu && !in_host) {
-                            float rel_w = row_weights[k] / total_weight;
-                            if (rel_w < st->prune_nvme_thresh && (remaining_mass - rel_w) >= st->prune_min_mass) {
+                        // Tier 1: in GPU - NEVER prune (cost is zero).
+                        if (in_gpu) {
+                            continue;
+                        }
+
+                        float rel_w = row_weights[k] / total_weight;
+
+                        // Tier 2: in Host RAM (pinned) - prune only if prune_host_thresh > 0 and rel_w < prune_host_thresh
+                        if (in_host) {
+                            if (st->prune_host_thresh > 0.0f && rel_w < st->prune_host_thresh && (remaining_mass - rel_w) >= st->prune_min_mass) {
                                 row_weights[k] = 0.0f;
-                                row_ids[k] = resident_real;
+                                row_ids[k] = alias_target;
                                 remaining_mass -= rel_w;
                                 kept_count--;
                                 weights_modified = true;
-                                if (st->is_decode_phase) st->decode_pruned_nvme++;
+                                if (st->is_decode_phase) st->decode_pruned_host++;
                             }
+                            continue;
+                        }
+
+                        // Tier 3: Cold NVMe Miss (!in_gpu && !in_host)
+                        // Prune if rel_w < prune_nvme_thresh OR satiety: in_mem_mass >= prune_min_mass
+                        bool should_prune_nvme = (rel_w < st->prune_nvme_thresh) ||
+                                                 (in_mem_mass >= st->prune_min_mass);
+
+                        if (should_prune_nvme && (remaining_mass - rel_w) >= st->prune_min_mass) {
+                            row_weights[k] = 0.0f;
+                            row_ids[k] = alias_target;
+                            remaining_mass -= rel_w;
+                            kept_count--;
+                            weights_modified = true;
+                            if (st->is_decode_phase) st->decode_pruned_nvme++;
                         }
                     }
 
@@ -679,6 +766,15 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                 cudaMemcpyAsync((char *) lc.down_scale.gpu_tensor->data + (size_t) hit.gpu_slot * sizeof(float),
                                 &lc.host_down_scale[hit.real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
             }
+        } else if (st->has_interleaved) {
+            const auto & meta = st->interleaved_hdr.layers[il];
+            const uint8_t * s_ptr = lc.host_interleaved.slot_ptr(hit.host_slot);
+            cudaMemcpyAsync((char *) lc.gate.gpu_tensor->data + (size_t) hit.gpu_slot * lc.gate.row_bytes,
+                            s_ptr, lc.gate.row_bytes, cudaMemcpyHostToDevice, st->h2d_stream);
+            cudaMemcpyAsync((char *) lc.up.gpu_tensor->data + (size_t) hit.gpu_slot * lc.up.row_bytes,
+                            s_ptr + meta.gate_row_bytes, lc.up.row_bytes, cudaMemcpyHostToDevice, st->h2d_stream);
+            cudaMemcpyAsync((char *) lc.down.gpu_tensor->data + (size_t) hit.gpu_slot * lc.down.row_bytes,
+                            s_ptr + meta.gate_row_bytes + meta.up_row_bytes, lc.down.row_bytes, cudaMemcpyHostToDevice, st->h2d_stream);
         } else {
             gpu_fill_from_host_async(*st, lc, lc.gate, lc.host_gate, hit.gpu_slot, hit.host_slot, hit.real_id);
             gpu_fill_from_host_async(*st, lc, lc.up,   lc.host_up,   hit.gpu_slot, hit.host_slot, hit.real_id);
@@ -689,88 +785,19 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 
     // --- Step 3: Pipelined NVMe reads + instant H2D dispatch per completed expert ---
     if (!nvme_tasks.empty()) {
-        enum class subjob_bank_type {
-            FUSED_GATE_UP,
-            FUSED_DOWN,
-            GATE,
-            UP,
-            DOWN
-        };
-
-        struct nvme_subjob {
-            int fd;
-            size_t offset;
-            size_t len;
-            uint8_t * out;
-            size_t staging_idx;
-            nvme_expert_task * task;
-            subjob_bank_type btype;
-        };
-        std::vector<nvme_subjob> subjobs;
-        subjobs.reserve(nvme_tasks.size() * (lc.fused_gate_up ? 2 : 3));
-
-        for (auto & t : nvme_tasks) {
-            if (lc.fused_gate_up) {
-                subjobs.push_back({ lc.gate_up.fd_direct, lc.gate_up.base_offset + (size_t) t.real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(t.host_slot), 0, &t, subjob_bank_type::FUSED_GATE_UP });
-                subjobs.push_back({ lc.down.fd_direct,    lc.down.base_offset    + (size_t) t.real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(t.host_slot),    0, &t, subjob_bank_type::FUSED_DOWN });
-            } else {
-                subjobs.push_back({ lc.gate.fd_direct, lc.gate.base_offset + (size_t) t.real_id * lc.gate.row_bytes, lc.gate.row_bytes, lc.host_gate.slot_ptr(t.host_slot), 0, &t, subjob_bank_type::GATE });
-                subjobs.push_back({ lc.up.fd_direct,   lc.up.base_offset   + (size_t) t.real_id * lc.up.row_bytes,   lc.up.row_bytes,   lc.host_up.slot_ptr(t.host_slot),   0, &t, subjob_bank_type::UP });
-                subjobs.push_back({ lc.down.fd_direct, lc.down.base_offset + (size_t) t.real_id * lc.down.row_bytes, lc.down.row_bytes, lc.host_down.slot_ptr(t.host_slot), 0, &t, subjob_bank_type::DOWN });
-            }
-        }
-
-        auto dispatch_bank_to_gpu = [&](const nvme_subjob & sj) {
-            switch (sj.btype) {
-                case subjob_bank_type::GATE:
-                    gpu_fill_from_host_async(*st, lc, lc.gate, lc.host_gate, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
-                    break;
-                case subjob_bank_type::UP:
-                    gpu_fill_from_host_async(*st, lc, lc.up, lc.host_up, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
-                    break;
-                case subjob_bank_type::DOWN:
-                    gpu_fill_from_host_async(*st, lc, lc.down, lc.host_down, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
-                    break;
-                case subjob_bank_type::FUSED_GATE_UP:
-                    gpu_fill_from_host_async(*st, lc, lc.gate_up, lc.host_gate_up, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
-                    if (lc.gate_up_scale.gpu_tensor && !lc.host_gate_up_scale.empty()) {
-                        cudaMemcpyAsync((char *) lc.gate_up_scale.gpu_tensor->data + (size_t) sj.task->gpu_slot * sizeof(float),
-                                        &lc.host_gate_up_scale[sj.task->real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
-                    }
-                    break;
-                case subjob_bank_type::FUSED_DOWN:
-                    gpu_fill_from_host_async(*st, lc, lc.down, lc.host_down, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
-                    if (lc.down_scale.gpu_tensor && !lc.host_down_scale.empty()) {
-                        cudaMemcpyAsync((char *) lc.down_scale.gpu_tensor->data + (size_t) sj.task->gpu_slot * sizeof(float),
-                                        &lc.host_down_scale[sj.task->real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
-                    }
-                    break;
-            }
-            any_gpu_fill = true;
-        };
-
-        if (!st->uring.initialized) {
-            for (auto & sj : subjobs) {
-                if (!read_odirect(sj.fd, sj.offset, sj.len, sj.out)) {
-                    fprintf(stderr, "[cache] FATAL: read_odirect failed\n");
-                    abort();
-                }
-                dispatch_bank_to_gpu(sj);
-            }
-        } else {
-            size_t total = subjobs.size();
+        if (st->has_interleaved && !lc.fused_gate_up) {
+            const auto & meta = st->interleaved_hdr.layers[il];
+            size_t total = nvme_tasks.size();
             for (size_t start = 0; start < total; start += st->uring.max_batch) {
                 size_t batch_size = std::min(total - start, st->uring.max_batch);
                 for (size_t i = 0; i < batch_size; i++) {
-                    auto & sj = subjobs[start + i];
-                    sj.staging_idx = i;
-                    size_t aligned_off = align_down(sj.offset);
-                    size_t front_pad   = sj.offset - aligned_off;
-                    size_t aligned_len  = align_up(front_pad + sj.len);
+                    auto & task = nvme_tasks[start + i];
+                    size_t off = meta.file_offset + (size_t) task.real_id * meta.expert_size;
+                    uint8_t * dst = lc.host_interleaved.slot_ptr(task.host_slot);
 
                     io_uring_sqe * sqe = io_uring_get_sqe(&st->uring.ring);
-                    io_uring_prep_read(sqe, sj.fd, st->uring.staging_buffers[i], aligned_len, aligned_off);
-                    io_uring_sqe_set_data64(sqe, (uint64_t)&sj);
+                    io_uring_prep_read(sqe, st->interleaved_fd, dst, meta.expert_size, off);
+                    io_uring_sqe_set_data64(sqe, (uint64_t)&task);
                 }
 
                 int ret = io_uring_submit(&st->uring.ring);
@@ -787,19 +814,139 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                         fprintf(stderr, "[cache] FATAL: io_uring_wait_cqe failed: %d\n", wret);
                         abort();
                     }
-                    auto * sj = (nvme_subjob *) io_uring_cqe_get_data64(cqe);
+                    auto * task = (nvme_expert_task *) io_uring_cqe_get_data64(cqe);
                     int res = cqe->res;
                     io_uring_cqe_seen(&st->uring.ring, cqe);
                     completed++;
 
-                    size_t aligned_off = align_down(sj->offset);
-                    size_t front_pad   = sj->offset - aligned_off;
-                    if (res < 0 || (size_t) res < front_pad + sj->len) {
-                        fprintf(stderr, "[cache] FATAL: read error in io_uring: res=%d, expected=%zu\n", res, front_pad + sj->len);
+                    if (res < 0 || (size_t) res < meta.expert_size) {
+                        fprintf(stderr, "[cache] FATAL: interleaved read error: res=%d, expected=%u\n", res, meta.expert_size);
                         abort();
                     }
-                    memcpy(sj->out, st->uring.staging_buffers[sj->staging_idx] + front_pad, sj->len);
-                    dispatch_bank_to_gpu(*sj);
+
+                    const uint8_t * s_ptr = lc.host_interleaved.slot_ptr(task->host_slot);
+                    cudaMemcpyAsync((char *) lc.gate.gpu_tensor->data + (size_t) task->gpu_slot * lc.gate.row_bytes,
+                                    s_ptr, lc.gate.row_bytes, cudaMemcpyHostToDevice, st->h2d_stream);
+                    cudaMemcpyAsync((char *) lc.up.gpu_tensor->data + (size_t) task->gpu_slot * lc.up.row_bytes,
+                                    s_ptr + meta.gate_row_bytes, lc.up.row_bytes, cudaMemcpyHostToDevice, st->h2d_stream);
+                    cudaMemcpyAsync((char *) lc.down.gpu_tensor->data + (size_t) task->gpu_slot * lc.down.row_bytes,
+                                    s_ptr + meta.gate_row_bytes + meta.up_row_bytes, lc.down.row_bytes, cudaMemcpyHostToDevice, st->h2d_stream);
+                    any_gpu_fill = true;
+                }
+            }
+        } else {
+            enum class subjob_bank_type {
+                FUSED_GATE_UP,
+                FUSED_DOWN,
+                GATE,
+                UP,
+                DOWN
+            };
+
+            struct nvme_subjob {
+                int fd;
+                size_t offset;
+                size_t len;
+                uint8_t * out;
+                size_t staging_idx;
+                nvme_expert_task * task;
+                subjob_bank_type btype;
+            };
+            std::vector<nvme_subjob> subjobs;
+            subjobs.reserve(nvme_tasks.size() * (lc.fused_gate_up ? 2 : 3));
+
+            for (auto & t : nvme_tasks) {
+                if (lc.fused_gate_up) {
+                    subjobs.push_back({ lc.gate_up.fd_direct, lc.gate_up.base_offset + (size_t) t.real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(t.host_slot), 0, &t, subjob_bank_type::FUSED_GATE_UP });
+                    subjobs.push_back({ lc.down.fd_direct,    lc.down.base_offset    + (size_t) t.real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(t.host_slot),    0, &t, subjob_bank_type::FUSED_DOWN });
+                } else {
+                    subjobs.push_back({ lc.gate.fd_direct, lc.gate.base_offset + (size_t) t.real_id * lc.gate.row_bytes, lc.gate.row_bytes, lc.host_gate.slot_ptr(t.host_slot), 0, &t, subjob_bank_type::GATE });
+                    subjobs.push_back({ lc.up.fd_direct,   lc.up.base_offset   + (size_t) t.real_id * lc.up.row_bytes,   lc.up.row_bytes,   lc.host_up.slot_ptr(t.host_slot),   0, &t, subjob_bank_type::UP });
+                    subjobs.push_back({ lc.down.fd_direct, lc.down.base_offset + (size_t) t.real_id * lc.down.row_bytes, lc.down.row_bytes, lc.host_down.slot_ptr(t.host_slot), 0, &t, subjob_bank_type::DOWN });
+                }
+            }
+
+            auto dispatch_bank_to_gpu = [&](const nvme_subjob & sj) {
+                switch (sj.btype) {
+                    case subjob_bank_type::GATE:
+                        gpu_fill_from_host_async(*st, lc, lc.gate, lc.host_gate, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
+                        break;
+                    case subjob_bank_type::UP:
+                        gpu_fill_from_host_async(*st, lc, lc.up, lc.host_up, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
+                        break;
+                    case subjob_bank_type::DOWN:
+                        gpu_fill_from_host_async(*st, lc, lc.down, lc.host_down, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
+                        break;
+                    case subjob_bank_type::FUSED_GATE_UP:
+                        gpu_fill_from_host_async(*st, lc, lc.gate_up, lc.host_gate_up, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
+                        if (lc.gate_up_scale.gpu_tensor && !lc.host_gate_up_scale.empty()) {
+                            cudaMemcpyAsync((char *) lc.gate_up_scale.gpu_tensor->data + (size_t) sj.task->gpu_slot * sizeof(float),
+                                            &lc.host_gate_up_scale[sj.task->real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
+                        }
+                        break;
+                    case subjob_bank_type::FUSED_DOWN:
+                        gpu_fill_from_host_async(*st, lc, lc.down, lc.host_down, sj.task->gpu_slot, sj.task->host_slot, sj.task->real_id);
+                        if (lc.down_scale.gpu_tensor && !lc.host_down_scale.empty()) {
+                            cudaMemcpyAsync((char *) lc.down_scale.gpu_tensor->data + (size_t) sj.task->gpu_slot * sizeof(float),
+                                            &lc.host_down_scale[sj.task->real_id], sizeof(float), cudaMemcpyHostToDevice, st->h2d_stream);
+                        }
+                        break;
+                }
+                any_gpu_fill = true;
+            };
+
+            if (!st->uring.initialized) {
+                for (auto & sj : subjobs) {
+                    if (!read_odirect(sj.fd, sj.offset, sj.len, sj.out)) {
+                        fprintf(stderr, "[cache] FATAL: read_odirect failed\n");
+                        abort();
+                    }
+                    dispatch_bank_to_gpu(sj);
+                }
+            } else {
+                size_t total = subjobs.size();
+                for (size_t start = 0; start < total; start += st->uring.max_batch) {
+                    size_t batch_size = std::min(total - start, st->uring.max_batch);
+                    for (size_t i = 0; i < batch_size; i++) {
+                        auto & sj = subjobs[start + i];
+                        sj.staging_idx = i;
+                        size_t aligned_off = align_down(sj.offset);
+                        size_t front_pad   = sj.offset - aligned_off;
+                        size_t aligned_len  = align_up(front_pad + sj.len);
+
+                        io_uring_sqe * sqe = io_uring_get_sqe(&st->uring.ring);
+                        io_uring_prep_read(sqe, sj.fd, st->uring.staging_buffers[i], aligned_len, aligned_off);
+                        io_uring_sqe_set_data64(sqe, (uint64_t)&sj);
+                    }
+
+                    int ret = io_uring_submit(&st->uring.ring);
+                    if (ret < 0) {
+                        fprintf(stderr, "[cache] FATAL: io_uring_submit failed: %d\n", ret);
+                        abort();
+                    }
+
+                    size_t completed = 0;
+                    while (completed < batch_size) {
+                        io_uring_cqe * cqe = nullptr;
+                        int wret = io_uring_wait_cqe(&st->uring.ring, &cqe);
+                        if (wret < 0 || !cqe) {
+                            fprintf(stderr, "[cache] FATAL: io_uring_wait_cqe failed: %d\n", wret);
+                            abort();
+                        }
+                        auto * sj = (nvme_subjob *) io_uring_cqe_get_data64(cqe);
+                        int res = cqe->res;
+                        io_uring_cqe_seen(&st->uring.ring, cqe);
+                        completed++;
+
+                        size_t aligned_off = align_down(sj->offset);
+                        size_t front_pad   = sj->offset - aligned_off;
+                        if (res < 0 || (size_t) res < front_pad + sj->len) {
+                            fprintf(stderr, "[cache] FATAL: read error in io_uring: res=%d, expected=%zu\n", res, front_pad + sj->len);
+                            abort();
+                        }
+                        memcpy(sj->out, st->uring.staging_buffers[sj->staging_idx] + front_pad, sj->len);
+                        dispatch_bank_to_gpu(*sj);
+                    }
                 }
             }
         }
@@ -832,14 +979,17 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                             cudaMemcpyHostToDevice,
                             st->h2d_stream);
         }
-        cudaStreamSynchronize(st->h2d_stream);
     } else {
         for (int64_t row = 0; row < n_tokens; row++) {
             ggml_backend_tensor_set(selected_experts, ids.data() + row * n_expert_used, row * selected_experts->nb[1], n_expert_used * sizeof(int32_t));
         }
-        if (any_gpu_fill) {
-            cudaStreamSynchronize(st->h2d_stream);
-        }
+    }
+
+    if (st->cuda_backend && st->ggml_h2d_event) {
+        cudaEventRecord((cudaEvent_t) st->ggml_h2d_event->context, st->h2d_stream);
+        ggml_backend_event_wait(st->cuda_backend, st->ggml_h2d_event);
+    } else if (any_gpu_fill) {
+        cudaStreamSynchronize(st->h2d_stream);
     }
 
     st->callback_hits++;
@@ -943,6 +1093,35 @@ static void setup_cache(cache_state & st, llama_model * model, const char * gguf
     }
     st.fd_direct = shards[0].fd_direct;
     fprintf(stderr, "[cache] Direct I/O initialized across %zu GGUF shard(s)\n", shards.size());
+
+    std::string interleaved_path;
+    const char * custom_interleaved = getenv("NVMOE_INTERLEAVED_PATH");
+    if (custom_interleaved) {
+        interleaved_path = custom_interleaved;
+    } else {
+        size_t last_slash = std::string(gguf_path).find_last_of("/\\");
+        if (last_slash != std::string::npos) {
+            interleaved_path = std::string(gguf_path).substr(0, last_slash) + "/interleaved_experts.bin";
+        } else {
+            interleaved_path = "interleaved_experts.bin";
+        }
+    }
+
+    st.interleaved_fd = open(interleaved_path.c_str(), O_RDONLY | O_DIRECT);
+    if (st.interleaved_fd >= 0) {
+        nvmoe_repack_header hdr;
+        if (read(st.interleaved_fd, &hdr, sizeof(hdr)) == sizeof(hdr) &&
+            hdr.magic == 0x4e564d4f4552504bULL && hdr.version == 1) {
+            st.has_interleaved = true;
+            st.interleaved_hdr = hdr;
+            fprintf(stderr, "[cache] Detected Contiguous 4096-Aligned Interleaved Storage (%s, %u layers, %u experts) -> Zero-Copy Direct I/O ENABLED!\n",
+                    interleaved_path.c_str(), hdr.n_layers, hdr.n_experts);
+        } else {
+            close(st.interleaved_fd);
+            st.interleaved_fd = -1;
+            st.has_interleaved = false;
+        }
+    }
 
     st.layers.resize(n_layer);
     size_t max_row_bytes = 0;
@@ -1065,7 +1244,11 @@ static void setup_cache(cache_state & st, llama_model * model, const char * gguf
         lc.host_lru.set_capacity_hint(lc.host_cache_size);
         lc.host_slot_of_real.assign(lc.n_expert_real, -1);
         lc.host_real_in_slot.assign(lc.host_cache_size, -1);
-        if (lc.fused_gate_up) {
+        if (st.has_interleaved && !lc.fused_gate_up) {
+            uint32_t exp_size = st.interleaved_hdr.layers[il].expert_size;
+            lc.host_interleaved.init(lc.host_cache_size, exp_size);
+            max_row_bytes = std::max<size_t>(max_row_bytes, exp_size);
+        } else if (lc.fused_gate_up) {
             lc.host_gate_up.init(lc.host_cache_size, lc.gate_up.row_bytes);
             lc.host_down.init(lc.host_cache_size, lc.down.row_bytes);
         } else {
@@ -1080,6 +1263,11 @@ static void setup_cache(cache_state & st, llama_model * model, const char * gguf
             fprintf(stderr, "[cache] layer %d: GPU cache_size=%lld, host cache_size=%lld (real n_expert=%lld), row_bytes gate_up=%zu down=%zu (pinned=%s)\n",
                     il, (long long) lc.cache_size, (long long) lc.host_cache_size, (long long) lc.n_expert_real,
                     lc.gate_up.row_bytes, lc.down.row_bytes, lc.host_gate_up.is_pinned ? "YES" : "NO");
+        } else if (st.has_interleaved) {
+            uint32_t exp_size = st.interleaved_hdr.layers[il].expert_size;
+            fprintf(stderr, "[cache] layer %d: GPU cache_size=%lld, host cache_size=%lld (real n_expert=%lld), interleaved expert_size=%u B (pinned=%s, zero-copy direct I/O)\n",
+                    il, (long long) lc.cache_size, (long long) lc.host_cache_size, (long long) lc.n_expert_real,
+                    exp_size, lc.host_interleaved.is_pinned ? "YES" : "NO");
         } else {
             fprintf(stderr, "[cache] layer %d: GPU cache_size=%lld, host cache_size=%lld (real n_expert=%lld), row_bytes gate=%zu up=%zu down=%zu (pinned=%s)\n",
                     il, (long long) lc.cache_size, (long long) lc.host_cache_size, (long long) lc.n_expert_real,
@@ -1188,7 +1376,11 @@ static void prewarm_cache(cache_state & st) {
                 lc.host_lru.insert_new(real_id);
             }
 
-            if (lc.fused_gate_up) {
+            if (st.has_interleaved && !lc.fused_gate_up) {
+                int il = &lc - &st.layers[0];
+                const auto & meta = st.interleaved_hdr.layers[il];
+                prewarm_jobs.push_back({ st.interleaved_fd, meta.file_offset + (size_t) real_id * meta.expert_size, meta.expert_size, lc.host_interleaved.slot_ptr(slot) });
+            } else if (lc.fused_gate_up) {
                 prewarm_jobs.push_back({ lc.gate_up.fd_direct, lc.gate_up.base_offset + (size_t) real_id * lc.gate_up.row_bytes, lc.gate_up.row_bytes, lc.host_gate_up.slot_ptr(slot) });
                 prewarm_jobs.push_back({ lc.down.fd_direct,    lc.down.base_offset    + (size_t) real_id * lc.down.row_bytes,    lc.down.row_bytes,    lc.host_down.slot_ptr(slot) });
             } else {
@@ -1242,6 +1434,16 @@ static void prewarm_cache(cache_state & st) {
                     cudaMemcpyAsync((char *) lc.down_scale.gpu_tensor->data + (size_t) gpu_slot * sizeof(float),
                                     &lc.host_down_scale[real_id], sizeof(float), cudaMemcpyHostToDevice, st.h2d_stream);
                 }
+            } else if (st.has_interleaved) {
+                int il = &lc - &st.layers[0];
+                const auto & meta = st.interleaved_hdr.layers[il];
+                const uint8_t * s_ptr = lc.host_interleaved.slot_ptr(gpu_slot);
+                cudaMemcpyAsync((char *) lc.gate.gpu_tensor->data + (size_t) gpu_slot * lc.gate.row_bytes,
+                                s_ptr, lc.gate.row_bytes, cudaMemcpyHostToDevice, st.h2d_stream);
+                cudaMemcpyAsync((char *) lc.up.gpu_tensor->data + (size_t) gpu_slot * lc.up.row_bytes,
+                                s_ptr + meta.gate_row_bytes, lc.up.row_bytes, cudaMemcpyHostToDevice, st.h2d_stream);
+                cudaMemcpyAsync((char *) lc.down.gpu_tensor->data + (size_t) gpu_slot * lc.down.row_bytes,
+                                s_ptr + meta.gate_row_bytes + meta.up_row_bytes, lc.down.row_bytes, cudaMemcpyHostToDevice, st.h2d_stream);
             } else {
                 cudaMemcpyAsync((char *) lc.gate.gpu_tensor->data + (size_t) gpu_slot * lc.gate.row_bytes,
                                 lc.host_gate.slot_ptr(gpu_slot), lc.gate.row_bytes, cudaMemcpyHostToDevice, st.h2d_stream);
@@ -1327,11 +1529,15 @@ static bool run_inference_request(
     auto t_start = std::chrono::steady_clock::now();
 
     st.is_decode_phase = false;
-    llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(prompt_tokens.data()), prompt_tokens.size());
-    if (llama_decode(ctx, batch) != 0) {
-        fprintf(stderr, "[server] prompt decode failed\n");
-        common_sampler_free(smpl);
-        return false;
+    llama_batch batch;
+    for (size_t i = 0; i < prompt_tokens.size(); i += base_params.n_batch) {
+        size_t n_eval = std::min((size_t) base_params.n_batch, prompt_tokens.size() - i);
+        batch = llama_batch_get_one(const_cast<llama_token *>(prompt_tokens.data() + i), n_eval);
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "[server] prompt decode failed\n");
+            common_sampler_free(smpl);
+            return false;
+        }
     }
 
     auto t_prompt_done = std::chrono::steady_clock::now();
@@ -1425,13 +1631,15 @@ int main(int argc, char ** argv) {
 
     const char * prune_env = getenv("NVMOE_PRUNE_NVME_THRESH");
     st.prune_nvme_thresh = prune_env ? atof(prune_env) : 0.0f;
+    const char * prune_host_env = getenv("NVMOE_PRUNE_HOST_THRESH");
+    if (prune_host_env) st.prune_host_thresh = atof(prune_host_env);
     const char * prune_keep_env = getenv("NVMOE_PRUNE_MIN_KEEP");
     if (prune_keep_env) st.prune_min_keep = atoi(prune_keep_env);
     const char * prune_mass_env = getenv("NVMOE_PRUNE_MIN_MASS");
     if (prune_mass_env) st.prune_min_mass = atof(prune_mass_env);
-    if (st.prune_nvme_thresh > 0.0f) {
-        fprintf(stderr, "[prune] Zero-IO Tail Pruning enabled: thresh=%.4f (min_keep=%d, min_mass=%.3f)\n",
-                st.prune_nvme_thresh, st.prune_min_keep, st.prune_min_mass);
+    if (st.prune_nvme_thresh > 0.0f || st.prune_host_thresh > 0.0f) {
+        fprintf(stderr, "[prune] Cost-Aware Expert Pruning enabled: nvme_thresh=%.4f host_thresh=%.4f (min_keep=%d, min_mass=%.3f)\n",
+                st.prune_nvme_thresh, st.prune_host_thresh, st.prune_min_keep, st.prune_min_mass);
     }
 
     llama_model_params mparams = common_model_params_to_llama(params);
@@ -1467,7 +1675,7 @@ int main(int argc, char ** argv) {
     }
     if (min_cache > 0) {
         int32_t top_k = st.expert_used_count > 0 ? st.expert_used_count : 8;
-        int32_t safe_ubatch = std::max(1, (min_cache - 4) / top_k);
+        int32_t safe_ubatch = std::min(6, std::max(1, (min_cache - 4) / top_k));
         if (cparams.n_ubatch > safe_ubatch) {
             fprintf(stderr, "[cache] auto-clamping n_ubatch from %d to %d (cache_size=%d, top-%d routing)\n",
                     cparams.n_ubatch, safe_ubatch, min_cache, top_k);
@@ -1480,6 +1688,20 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to create context\n");
         llama_model_free(model);
         return 1;
+    }
+
+    ggml_backend_sched_t sched = ctx->get_sched();
+    if (sched) {
+        int n_backends = ggml_backend_sched_get_n_backends(sched);
+        for (int i = 0; i < n_backends; i++) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+            if (b && ggml_backend_is_cuda(b)) {
+                st.cuda_backend = b;
+                st.ggml_h2d_event = ggml_backend_event_new(b->device);
+                fprintf(stderr, "[cache] non-blocking CUDA hardware sync hooked up to backend %s\n", ggml_backend_name(b));
+                break;
+            }
+        }
     }
 
     if (server_mode) {
@@ -1664,12 +1886,15 @@ int main(int argc, char ** argv) {
     common_sampler * smpl = common_sampler_init(model, params.sampling);
 
     auto t_start = std::chrono::steady_clock::now();
-    llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
     st.is_decode_phase = false;
-
-    if (llama_decode(ctx, batch) != 0) {
-        fprintf(stderr, "prompt decode failed\n");
-        return 1;
+    llama_batch batch;
+    for (size_t i = 0; i < tokens.size(); i += params.n_batch) {
+        size_t n_eval = std::min((size_t) params.n_batch, tokens.size() - i);
+        batch = llama_batch_get_one(tokens.data() + i, n_eval);
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "prompt decode failed\n");
+            return 1;
+        }
     }
 
     auto t_prompt_done = std::chrono::steady_clock::now();
@@ -1795,6 +2020,9 @@ int main(int argc, char ** argv) {
             st.decode_host_hits, total_host_lookups, host_hit_rate, nvme_miss_rate);
     if (st.decode_pruned_nvme > 0) {
         fprintf(stderr, "Decode NVMe Pruned:   %ld tail misses skipped (Zero-IO dynamic pruning)\n", st.decode_pruned_nvme);
+    }
+    if (st.decode_pruned_host > 0) {
+        fprintf(stderr, "Decode Host Pruned:   %ld host transfers skipped (PCIe bandwidth saving)\n", st.decode_pruned_host);
     }
     fprintf(stderr, "Cumulative Stats:     callback_hits=%ld gpu_hits=%ld gpu_misses=%ld host_hits=%ld host_misses=%ld\n",
             st.callback_hits, st.hits, st.misses, st.host_hits, st.host_misses);

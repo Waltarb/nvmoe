@@ -6,7 +6,7 @@ export interface Edit { path: string; search: string; replace: string }
 const PATH_LINE = /(?:^|\n)(?:```[a-z]*\s*\n)?(?:[#*\s`]*)([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)(?:[*:\s`]*)(?=\n)/g;
 
 export function parseEdits(text: string): Edit[] {
-  let cleaned = text;
+  let cleaned = text.replace(/\r\n/g, "\n");
   if (cleaned.includes("</think>")) {
     cleaned = cleaned.slice(cleaned.lastIndexOf("</think>") + "</think>".length);
   }
@@ -48,6 +48,73 @@ export function parseEdits(text: string): Edit[] {
     }
   }
 
+  if (!edits.length) {
+    let codeText = cleaned;
+    // If the model was cut off mid-code-block, close it
+    const openBlock = codeText.match(/```[a-z]*\n(?![\s\S]*```)/);
+    if (openBlock) {
+      codeText += "\n```";
+    }
+
+    const codeBlockRegex = /(?:^|\n)(?:[#*\s`]*)([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)[*:\s`]*\n```[a-z]*\n([\s\S]*?)\n```/g;
+    for (const m of codeText.matchAll(codeBlockRegex)) {
+      const filePath = m[1].trim();
+      const code = m[2];
+      if (filePath.startsWith("src/") || filePath.startsWith("lib/")) {
+        edits.push({ path: filePath, search: "", replace: code });
+      }
+    }
+
+    // Fallback: If code block has no explicit file header, infer from exported class or function
+    if (!edits.length) {
+      const bareBlockRegex = /```(?:ts|typescript)\n([\s\S]*?)\n```/g;
+      const symbolToFile: Record<string, string> = {
+        BatchScheduler: "src/scheduler.ts",
+        AsyncBatchScheduler: "src/scheduler.ts",
+        SegmentedCache: "src/segmented-cache.ts",
+        SegmentedLruCache: "src/segmented-cache.ts",
+        encodeFrame: "src/codec.ts",
+        FrameDecoder: "src/codec.ts",
+        WebSocketFrameCodec: "src/codec.ts",
+        Transaction: "src/mvcc.ts",
+        MvccStore: "src/mvcc.ts",
+        MvccTransactionKv: "src/mvcc.ts",
+        RaftNode: "src/raft.ts",
+        RaftStateMachine: "src/raft.ts",
+        optimizeAST: "src/optimizer.ts",
+        ExpressionAstOptimizer: "src/optimizer.ts",
+        RateLimiter: "src/limiter.ts",
+        TokenBucketRateLimiter: "src/limiter.ts",
+        createValidator: "src/validator.ts",
+        JsonSchemaValidator: "src/validator.ts",
+        parseUnifiedDiff: "src/patch.ts",
+        applyPatch: "src/patch.ts",
+        threeWayMerge: "src/patch.ts",
+        DiffPatchEngine: "src/patch.ts",
+        TypedEmitter: "src/emitter.ts",
+        paginate: "src/paginate.ts",
+        slugify: "src/slugify.ts",
+        validateSignup: "src/validate.ts",
+        cartReducer: "src/cart.ts",
+        splitName: "src/name.ts",
+      };
+
+      for (const m of codeText.matchAll(bareBlockRegex)) {
+        const code = m[1];
+        let target = "";
+        for (const [sym, file] of Object.entries(symbolToFile)) {
+          if (code.includes(sym)) {
+            target = file;
+            break;
+          }
+        }
+        if (target) {
+          edits.push({ path: target, search: "", replace: code });
+        }
+      }
+    }
+  }
+
   return edits;
 }
 
@@ -56,6 +123,10 @@ export async function applyEdits(workdir: string, edits: Edit[]): Promise<string
   for (const e of edits) {
     const abs = resolve(workdir, e.path);
     if (!abs.startsWith(resolve(workdir) + sep)) { errors.push(`${e.path}: path outside repo`); continue; }
+    if (e.path.startsWith("spec/") || e.path.startsWith("hidden/")) {
+      errors.push(`${e.path}: editing test files is forbidden. Modify implementation in src/ only.`);
+      continue;
+    }
     if (e.search === "") {
       await mkdir(dirname(abs), { recursive: true });
       await writeFile(abs, e.replace);

@@ -1,16 +1,492 @@
-diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 518dc4b94..c66bcc9da 100644
---- a/src/models/qwen4exp.cpp
-+++ b/src/models/qwen4exp.cpp
-@@ -259,15 +259,28 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+diff --git a/ggml/src/ggml-cpu/binary-ops.cpp b/ggml/src/ggml-cpu/binary-ops.cpp
+index 75e382900..9cb5b8e92 100644
+--- a/ggml/src/ggml-cpu/binary-ops.cpp
++++ b/ggml/src/ggml-cpu/binary-ops.cpp
+@@ -127,10 +127,18 @@ static void binary_op(const ggml_compute_params * params, ggml_tensor * dst) {
+         apply_binary_op<op, ggml_bf16_t, float, ggml_bf16_t>(params, dst);
+     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32  && dst->type == GGML_TYPE_F32) {
+         apply_binary_op<op, ggml_bf16_t, float, float>(params, dst);
++    } else if (src0->type == GGML_TYPE_F32  && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
++        apply_binary_op<op, float, ggml_bf16_t, float>(params, dst);
++    } else if (src0->type == GGML_TYPE_F32  && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
++        apply_binary_op<op, float, ggml_bf16_t, ggml_bf16_t>(params, dst);
+     } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F32  && dst->type == GGML_TYPE_F16) {
+         apply_binary_op<op, ggml_fp16_t, float, ggml_fp16_t>(params, dst);
+     } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F32  && dst->type == GGML_TYPE_F32) {
+         apply_binary_op<op, ggml_fp16_t, float, float>(params, dst);
++    } else if (src0->type == GGML_TYPE_F32  && src1->type == GGML_TYPE_F16  && dst->type == GGML_TYPE_F32) {
++        apply_binary_op<op, float, ggml_fp16_t, float>(params, dst);
++    } else if (src0->type == GGML_TYPE_F32  && src1->type == GGML_TYPE_F16  && dst->type == GGML_TYPE_F16) {
++        apply_binary_op<op, float, ggml_fp16_t, ggml_fp16_t>(params, dst);
+     } else {
+         GGML_ABORT("%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__,
+             ggml_type_name(dst->type), ggml_type_name(src0->type), ggml_type_name(src1->type));
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 74bb47145..95644d0f9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2556,6 +2556,9 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+ 
+ #ifdef USE_CUDA_GRAPH
+ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
++    if (getenv("GGML_CUDA_DISABLE_GRAPHS")) {
++        return false;
++    }
+ 
+     bool use_cuda_graph = true;
+     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
+diff --git a/include/llama.h b/include/llama.h
+index 3ab935939..683a03a71 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -583,6 +583,11 @@ extern "C" {
+     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
+ 
+     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
++
++    // nvmoe: look up a model weight tensor by its exact GGUF name (e.g. "blk.0.ffn_gate_exps.weight").
++    // Returns NULL if not found. Used by the expert cache to read/write GPU-resident weight
++    // buffers directly (ggml_backend_tensor_get/set) for cache fills and slot-id remaps.
++    LLAMA_API struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
+     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
+ 
+     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 91bb5e7cc..7c9721ff6 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-model-loader.h"
++#include <cstdlib>
+ 
+ #include "ggml-alloc.h"
+ #include "ggml.h"
+@@ -843,6 +844,26 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
+         return &pos->second;
+     }
+ 
++    // Fallback aliases for Qwen4Exp hyper-connection head tensors
++    if (strcmp(name, "output_hc_norm.weight") == 0) {
++        pos = weights_map.find("hc_head_norm.weight");
++        if (pos != weights_map.end()) return &pos->second;
++    } else if (strcmp(name, "output_hc_down.weight") == 0) {
++        pos = weights_map.find("hc_head_down.weight");
++        if (pos != weights_map.end()) return &pos->second;
++    } else if (strcmp(name, "output_hc_up.weight") == 0) {
++        pos = weights_map.find("hc_head_up.weight");
++        if (pos != weights_map.end()) return &pos->second;
++    }
++
++    std::string s_name(name);
++    auto pos_ao = s_name.find(".attn_output.weight");
++    if (pos_ao != std::string::npos) {
++        std::string alt = s_name.substr(0, pos_ao) + ".attn_out.weight";
++        pos = weights_map.find(alt);
++        if (pos != weights_map.end()) return &pos->second;
++    }
++
+     return nullptr;
+ }
+ 
+@@ -1301,6 +1322,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             }
          }
  
-         layer.ffn_gate_up_exps = cache_size > 0 && cache_size < n_expert
--            ? create_tensor_reduced(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", il), { n_embd, n_ff_exp * 2, n_expert }, cache_size)
++        const bool is_1d = (ne.size() <= 1) || (ne.size() > 1 && [&]{
++            for (size_t d = 1; d < ne.size(); d++) if (ne.begin()[d] > 1) return false;
++            return true;
++        }());
++        if (type == GGML_TYPE_BF16 && is_1d) {
++            type = GGML_TYPE_F32;
++        }
++
+         ggml_tensor t_meta;
+         memset(&t_meta, 0, sizeof(ggml_tensor));
+         t_meta.type = type;
+@@ -1351,7 +1380,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         }
+     }
+ 
+-    GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
++    const bool is_1d = (t_meta.ne[1] == 1 && t_meta.ne[2] == 1 && t_meta.ne[3] == 1);
++    const bool convert_bf16_to_f32 = (t_meta.type == GGML_TYPE_BF16 && is_1d);
++    if (convert_bf16_to_f32) {
++        t_meta.type = GGML_TYPE_F32;
++        t_meta.nb[0] = sizeof(float);
++        t_meta.nb[1] = t_meta.nb[0] * t_meta.ne[0];
++        t_meta.nb[2] = t_meta.nb[1] * t_meta.ne[1];
++        t_meta.nb[3] = t_meta.nb[2] * t_meta.ne[2];
++    }
++
++    GGML_ASSERT(convert_bf16_to_f32 || ggml_nbytes(&t_meta) == ggml_nbytes(cur));
+ 
+     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+     if (buft == nullptr) {
+@@ -1382,6 +1421,89 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     return tensor;
+ }
+ 
++struct ggml_tensor * llama_model_loader::create_tensor_reduced(
++        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
++        const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne_real, int64_t reduced_last_dim, int flags) {
++    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne_real, !(flags & TENSOR_NOT_REQUIRED), /*allow_reshape=*/false);
++    if (cur == NULL) {
++        return NULL;
++    }
++
++    ggml_tensor t_meta = *cur;
++    if (t_meta.ne[1] == 1 && t_meta.ne[2] == 1 && t_meta.ne[3] == 1) {
++        // 1D tensor (e.g. per-expert scale tensor { n_expert })
++        t_meta.ne[0] = reduced_last_dim;
++        t_meta.nb[0] = ggml_type_size(t_meta.type);
++        t_meta.nb[1] = t_meta.nb[0] * (t_meta.ne[0] / ggml_blck_size(t_meta.type));
++        t_meta.nb[2] = t_meta.nb[1];
++        t_meta.nb[3] = t_meta.nb[2];
++    } else {
++        // only the last (expert-count) dimension shrinks; nb[0..2] don't depend on ne[2] itself,
++        // only nb[3] (= nb[2]*ne[2], used by ggml_nbytes) needs recomputing.
++        t_meta.ne[2] = reduced_last_dim;
++        t_meta.nb[3] = t_meta.nb[2] * t_meta.ne[2];
++    }
++
++    const llm_tensor_info & info = llm_tensor_info_for(tn.tensor);
++    ggml_backend_buffer_type_t buft = select_weight_buft(hparams, &t_meta, info.op, buft_list_layer);
++    if (!buft) {
++        throw std::runtime_error(format("failed to find a compatible buffer type for reduced tensor %s", tn.str().c_str()));
++    }
++
++    // Shrinking only matters for the GPU tier (VRAM is the scarce resource); a CPU-backed
++    // tensor for this layer would, under mmap load mode, get its ->data pointer set via a
++    // completely different path (ggml_backend_dev_buffer_from_host_ptr wrapping the mmap,
++    // driven by weights_map lookups) that this reduced tensor is deliberately not part of --
++    // it would silently stay null. So: only take the reduced path when the tensor actually
++    // landed on a GPU device; let the caller fall back to the normal, full-size create_tensor
++    // for CPU-placed layers.
++    ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
++    // NOTE: checking ggml_backend_dev_type(buft_dev) == GPU is not enough -- CPU-placed
++    // layers can still resolve to the "CUDA_Host" buffer type (pinned host memory used
++    // to speed up H2D transfer), which reports its device as the CUDA device even though
++    // compute for that layer still runs on the CPU. The real VRAM buffer type is always
++    // exactly a GPU device's own default/primary buft, so require that instead.
++    bool is_real_gpu_buft = buft_dev
++        && ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_GPU
++        && buft == ggml_backend_dev_buffer_type(buft_dev);
++    if (!is_real_gpu_buft) {
++        return nullptr;
++    }
++
++    const ctx_key key { buft, false };
++    ggml_context * ctx;
++    auto it = ctx_map.find(key);
++    if (it == ctx_map.end()) {
++        int max_n_tensors = n_tensors;
++        max_n_tensors += 1;
++        max_n_tensors += hparams.n_layer()*8;
++        if (files.empty()) {
++            max_n_tensors += hparams.n_layer()*256;
++        }
++        const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
++
++        ggml_init_params params = {
++            /*.mem_size   =*/ ctx_size,
++            /*.mem_buffer =*/ NULL,
++            /*.no_alloc   =*/ true,
++        };
++        ctx = ggml_init(params);
++        if (!ctx) {
++            throw std::runtime_error(format("failed to create ggml context"));
++        }
++        ctx_map.emplace(key, ctx);
++    } else {
++        ctx = it->second.get();
++    }
++
++    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
++    ggml_set_name(tensor, tn.str().c_str());
++    n_created++;
++    // deliberately NOT inserted into weights_map: load_all_data() must never try to
++    // memcpy the real (larger) on-disk tensor's bytes into this smaller allocation.
++    return tensor;
++}
++
+ void llama_model_loader::done_getting_tensors(bool partial) const {
+     if (n_created > n_tensors) {
+         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+@@ -1660,7 +1782,14 @@ bool llama_model_loader::load_all_data(
+                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+             } else {
+-                ggml_backend_tensor_set(cur, data, 0, n_size);
++                if (cur->type == GGML_TYPE_F32 && weight && weight->tensor->type == GGML_TYPE_BF16) {
++                    const int64_t n_elems = ggml_nelements(cur);
++                    std::vector<float> f32_buf(n_elems);
++                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) data, f32_buf.data(), n_elems);
++                    ggml_backend_tensor_set(cur, f32_buf.data(), 0, n_elems * sizeof(float));
++                } else {
++                    ggml_backend_tensor_set(cur, data, 0, n_size);
++                }
+             }
+         } else {
+             const auto & file = files.at(weight->idx);
+@@ -1740,7 +1869,7 @@ bool llama_model_loader::load_all_data(
+             }
+         }
+ 
+-        size_done += n_size;
++        size_done += (weight ? ggml_nbytes(weight->tensor) : n_size);
+     }
+ 
+     // free temporary resources used for async uploads
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 9e51d0ce7..c4fb409e6 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -238,6 +238,15 @@ struct llama_model_loader {
+         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+ 
++    // nvmoe: allocate a tensor properly placed via the normal buft/device selection path
++    // (same as create_tensor), but with its last dimension overridden to a smaller
++    // cache_size instead of the real on-disk expert count. NOT registered in weights_map,
++    // so load_all_data() will never try to copy the (larger) real tensor's bytes into it --
++    // the cache logic is responsible for filling it in itself.
++    struct ggml_tensor * create_tensor_reduced(
++        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
++        const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne_real, int64_t reduced_last_dim, int flags = 0);
++
+     void done_getting_tensors(bool partial = false) const;
+ 
+     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 10c731fb7..0ee3d3eec 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1,5 +1,7 @@
+ #include "llama-model.h"
+ 
++#include <cstdlib>
++
+ #include "llama-arch.h"
+ #include "llama-ext.h"
+ #include "llama-hparams.h"
+@@ -1593,8 +1595,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
+                 layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+             }
+-            if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
+-                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
++            if (!layer.ffn_up_exps_s && (layer.ffn_up_exps || layer.ffn_gate_up_exps)) {
++                if (layer.ffn_gate_up_exps) {
++                    layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
++                }
++                if (!layer.ffn_up_exps_s) {
++                    layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
++                }
+             }
+ 
+             // recurrent / linear-attention weight scales (per-tensor, shape {1})
+@@ -1694,7 +1701,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         }
+     }
+-    ml.done_getting_tensors();
++    ml.done_getting_tensors(getenv("NVMOE_CACHE_SIZE") != nullptr);
+ 
+     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+     // If sidecar scales exist, the output weight must be an actual output tensor.
+@@ -1867,6 +1874,10 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
+         tn, ne, flags);
+ }
+ 
++struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name) {
++    return const_cast<struct ggml_tensor *>(model->get_tensor(name));
++}
++
+ std::string llama_model::arch_name() const {
+     return llm_arch_name(arch);
+ }
+@@ -3262,6 +3273,13 @@ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std:
+     return create_tensor(*ml, tn, ne, flags);
+ }
+ 
++ggml_tensor * llama_model_base::create_tensor_reduced(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne_real, int64_t reduced_last_dim, int flags) {
++    GGML_ASSERT(ml != nullptr);
++    GGML_ASSERT(tn.bid != -1);
++    const buft_list_t * buft_list_layer = pimpl->dev_layer.at(tn.bid).buft_list;
++    return ml->create_tensor_reduced(hparams, buft_list_layer, tn, ne_real, reduced_last_dim, flags);
++}
++
+ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+     layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+     if (layer.ffn_gate_up_exps == nullptr) {
+diff --git a/src/llama-model.h b/src/llama-model.h
+index b09a6cb2c..0e8556091 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -803,6 +803,11 @@ struct llama_model_base : public llama_model {
+     // convenience overload of create_tensor that doesn't require llama_model_loader
+     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+ 
++    // nvmoe: like create_tensor, but allocates with the last dimension overridden to
++    // reduced_last_dim (a cache_size) instead of the real on-disk expert count -- see
++    // llama_model_loader::create_tensor_reduced for what this does and does not do.
++    ggml_tensor * create_tensor_reduced(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne_real, int64_t reduced_last_dim, int flags = 0);
++
+     // helper: try merged gate_up_exps first, fall back to separate gate and up
+     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
+                 int64_t n_ff_, int64_t n_expert_, int flags);
+diff --git a/src/models/glm5next.cpp b/src/models/glm5next.cpp
+index 5b617c02b..68a818b4d 100644
+--- a/src/models/glm5next.cpp
++++ b/src/models/glm5next.cpp
+@@ -199,9 +199,27 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
+             layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", il), {n_embd, n_expert}, flags);
+             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   il), {n_expert}, flags);
+ 
+-            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), {n_embd, hparams.n_ff_exp(), n_expert}, flags);
+-            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il), {n_embd, hparams.n_ff_exp(), n_expert}, flags);
+-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), {hparams.n_ff_exp(), n_embd, n_expert}, flags);
++            const int cache_size = nvmoe_cache_size();
++            layer.ffn_down_exps = cache_size > 0 && cache_size < (int) n_expert
++                ? create_tensor_reduced(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), {hparams.n_ff_exp(), n_embd, n_expert}, cache_size, flags)
++                : nullptr;
++            if (!layer.ffn_down_exps) {
++                layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), {hparams.n_ff_exp(), n_embd, n_expert}, flags);
++            }
++
++            layer.ffn_gate_exps = cache_size > 0 && cache_size < (int) n_expert
++                ? create_tensor_reduced(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), {n_embd, hparams.n_ff_exp(), n_expert}, cache_size, flags)
++                : nullptr;
++            if (!layer.ffn_gate_exps) {
++                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), {n_embd, hparams.n_ff_exp(), n_expert}, flags);
++            }
++
++            layer.ffn_up_exps = cache_size > 0 && cache_size < (int) n_expert
++                ? create_tensor_reduced(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", il), {n_embd, hparams.n_ff_exp(), n_expert}, cache_size, flags)
++                : nullptr;
++            if (!layer.ffn_up_exps) {
++                layer.ffn_up_exps = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", il), {n_embd, hparams.n_ff_exp(), n_expert}, flags);
++            }
+ 
+             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", il), {n_embd, hparams.n_ff_shexp}, flags);
+             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", il), {n_embd, hparams.n_ff_shexp}, flags);
+diff --git a/src/models/models.h b/src/models/models.h
+index 5bf728df6..0928d2928 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -17,6 +17,15 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor *
+     return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
+ }
+ 
++inline int nvmoe_cache_size() {
++    static int cache_size = -1;
++    if (cache_size < 0) {
++        const char * env = getenv("NVMOE_CACHE_SIZE");
++        cache_size = env ? atoi(env) : 0;
++    }
++    return cache_size;
++}
++
+ //
+ // base classes
+ //
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index bdf772625..b742a5722 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -1,6 +1,21 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <cstdlib>
++
++// --- nvmoe Phase 3 prototype -------------------------------------------------
++// When NVMOE_CACHE_SIZE is set, allocate the routed-expert weight tensors via
++// llama_model_base::create_tensor_reduced() with a reduced expert dimension
++// (cache_size instead of the model's real n_expert), so the cache's GPU tier only
++// ever holds cache_size experts' worth of VRAM per bank. That helper goes through
++// the model's normal buft/device selection and gets folded into the same bulk
++// backend-buffer allocation as every other weight (see llama_model_loader::
++// create_tensor_reduced) -- unlike an ad hoc ggml_context, this gives the tensor a
++// real ggml_backend_buffer_t on the correct device. It is NOT registered in
++// weights_map, so load_all_data() never tries to fill it from the file -- it starts
++// as an uninitialized backend allocation and is populated at runtime by the cache
++// logic (later phases).
++
+ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
+     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+@@ -93,8 +108,28 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+ 
+         // Routed experts
+         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
+-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
++
++        const int cache_size = nvmoe_cache_size();
++        // create_tensor_reduced() only succeeds for GPU-placed layers (see its comment);
++        // it returns nullptr for CPU-placed layers, where shrinking doesn't help anyway
++        // (VRAM is the scarce resource, not host RAM) -- fall back to the normal,
++        // full-size tensor in that case.
++        layer.ffn_down_exps = cache_size > 0 && cache_size < n_expert
++            ? create_tensor_reduced(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, cache_size)
++            : nullptr;
++        if (!layer.ffn_down_exps) {
++            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
++        }
++
++        layer.ffn_gate_exps = cache_size > 0 && cache_size < n_expert
++            ? create_tensor_reduced(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, n_ff_exp, n_expert }, cache_size)
++            : nullptr;
++        layer.ffn_up_exps = cache_size > 0 && cache_size < n_expert
++            ? create_tensor_reduced(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", il), { n_embd, n_ff_exp, n_expert }, cache_size)
++            : nullptr;
++        if (!layer.ffn_gate_exps || !layer.ffn_up_exps) {
++            create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
++        }
+ 
+         // Shared experts
+         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index e58d35034..c66bcc9da 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cinttypes>
++#include <cstdlib>
+ 
+ // bad metadata must be catchable: GGML_ASSERT aborts the whole process
+ static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
+@@ -192,7 +193,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+     for (int il = 0; il < n_layer; ++il) {
+         auto & layer = layers[il];
+ 
+-        const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
++        const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : (ml.get_weight("blk.0.ffn_down_exps.weight") ? ml.get_weight("blk.0.ffn_down_exps.weight")->tensor->ne[0] : n_ff);
+         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
+ 
+         const int64_t head_k_dim = hparams.ssm_d_state;
+@@ -248,8 +249,39 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+         }
+ 
+         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, 0);
+-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
+-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
++
++        const int cache_size = nvmoe_cache_size();
++        layer.ffn_down_exps = cache_size > 0 && cache_size < n_expert
++            ? create_tensor_reduced(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, cache_size)
++            : nullptr;
++        if (!layer.ffn_down_exps) {
++            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
++        }
++
++        layer.ffn_gate_up_exps = cache_size > 0 && cache_size < n_expert
 +            ? create_tensor_reduced(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", il), { n_embd, n_ff_exp * 2, n_expert }, cache_size, TENSOR_NOT_REQUIRED)
-             : nullptr;
-         if (!layer.ffn_gate_up_exps) {
--            create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
++            : nullptr;
++        if (!layer.ffn_gate_up_exps) {
 +            layer.ffn_gate_exps = cache_size > 0 && cache_size < n_expert
 +                ? create_tensor_reduced(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, n_ff_exp, n_expert }, cache_size, TENSOR_NOT_REQUIRED)
 +                : nullptr;
@@ -20,17 +496,56 @@ index 518dc4b94..c66bcc9da 100644
 +            if (!layer.ffn_gate_exps || !layer.ffn_up_exps) {
 +                create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
 +            }
-         }
- 
-         if (cache_size > 0 && cache_size < n_expert) {
-             layer.ffn_down_exps_s = create_tensor_reduced(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", il), { n_expert }, cache_size, TENSOR_NOT_REQUIRED);
--            layer.ffn_up_exps_s   = create_tensor_reduced(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", il), { n_expert }, cache_size, TENSOR_NOT_REQUIRED);
++        }
++
++        if (cache_size > 0 && cache_size < n_expert) {
++            layer.ffn_down_exps_s = create_tensor_reduced(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", il), { n_expert }, cache_size, TENSOR_NOT_REQUIRED);
 +            if (layer.ffn_gate_up_exps) {
 +                layer.ffn_up_exps_s   = create_tensor_reduced(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", il), { n_expert }, cache_size, TENSOR_NOT_REQUIRED);
 +            } else {
 +                layer.ffn_gate_exps_s = create_tensor_reduced(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", il), { n_expert }, cache_size, TENSOR_NOT_REQUIRED);
 +                layer.ffn_up_exps_s   = create_tensor_reduced(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", il), { n_expert }, cache_size, TENSOR_NOT_REQUIRED);
 +            }
-         }
++        }
  
          layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
+         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
+@@ -774,8 +806,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+ 
+     // Qwen3Next uses a single Q projection that outputs query + gate
+-    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
++    auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
++            n_embd_head * 2, n_head,
++            n_embd_head,     n_head_kv,
++            n_embd_head,     n_head_kv,
++            il, false);
+     cb(Qcur_full, "Qcur_full", il);
++    cb(Kcur, "Kcur", il);
++    cb(Vcur, "Vcur", il);
+ 
+     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+         ggml_element_size(Qcur_full) * n_embd_head * 2,
+@@ -785,12 +823,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+     cb(Qcur, "Qcur_normed", il);
+ 
+-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+-    cb(Kcur, "Kcur", il);
+-
+-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+-    cb(Vcur, "Vcur", il);
+-
+     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+     cb(Kcur, "Kcur_normed", il);
+@@ -891,6 +923,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+ 
+     ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
++    if (conv_kernel->type != GGML_TYPE_F32) {
++        conv_kernel = ggml_cast(ctx0, conv_kernel, GGML_TYPE_F32);
++    }
+     const int64_t conv_kernel_size = conv_kernel->ne[0];
+ 
+     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner

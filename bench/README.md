@@ -80,4 +80,35 @@ Before trusting a new task: write a reference solution and confirm the hidden te
 | 04-cart-reducer | state: bugfix + feature + immutability | 10 |
 | 05-user-name-split | multi-file refactor + tsc | 8 |
 
-All five were validated end to end against reference solutions through a mock endpoint.
+## Core tier ("Hard Core SWE Suite")
+
+High-difficulty systems programming tasks designed so frontier models do not saturate at 100/100:
+
+| Task | Category | Description | Hidden tests |
+| --- | --- | --- | --- |
+| 06-async-batch-scheduler | concurrency | Async request batching with per-item cancellation, timeout, and listener leak prevention | 8 |
+| 07-segmented-lru-cache | memory | 2Q / Segmented LRU cache with probation, protected, and ghost buffers + TTL | 6 |
+| 08-websocket-frame-codec | networking | RFC 6455 binary WebSocket frame encoder & streaming chunked decoder with XOR masking | 7 |
+| 09-mvcc-transaction-kv | database | In-memory MVCC Snapshot Isolation with write conflict detection and vacuuming | 6 |
+| 10-raft-state-machine | distributed | Raft consensus state machine: RequestVote, AppendEntries, term rollover, and uncommitted log truncation | 7 |
+| 11-expression-ast-optimizer | ast | Algebraic and boolean AST optimizer with De Morgan laws, constant folding, and fixpoint | 6 |
+| 12-token-bucket-rate-limiter | distributed | Fractional token bucket rate limiter with burst spike mitigation and clock skew protection | 5 |
+| 13-json-schema-validator | serialization | Lightweight JSON Schema validator with cyclic `$ref` (binary tree) and `oneOf` | 5 |
+| 14-diff-patch-engine | tooling | Unified diff parser & 3-way merge with cumulative line drift compensation and conflict markers | 5 |
+| 15-event-emitter-typecheck | types | Strongly-typed hierarchical event bus with wildcard namespaces and strict `tsc` checks | 6 |
+
+## Benchmark Scoreboard & Hard Core Guide
+
+See [HARDCORE_BENCHMARK.md](./HARDCORE_BENCHMARK.md) for full task specifications, architectural invariants, scoring methodology, and instructions for evaluating external models (Ollama, vLLM, DeepSeek, Claude, GPT-4o, etc.).
+
+Run `pnpm compare` to view live results:
+
+| Config | Tier | Score (0-100) | Hidden Assertions % | Solved | Decode (tok/s) | TTFT (s) |
+| --- | --- | --- | --- | --- | --- | --- |
+| `qwen38-nvfp4` (NVMoE Local) | core | **80.0** | **98.4%** | **8/10** | 5.37 | 210.2s |
+| `gemini-3.8-flash-high` (Frontier Baseline) | core | **70.0** | **91.8%** | 7/10 | 113.0 | 0.4s |
+| `qwen38-iq2` (NVMoE Local) | core | **40.0** | **37.7%** | 4/10 | **30.3** | **19.7s** |
+| `qwen38-flash-nvfp4` (NVMoE Local) | smoke | **100.0** | **100%** | 5/5 | 6.89 | 62.6s |
+| `glm53-flash-iq2xxs` (NVMoE Local) | smoke | **100.0** | **100%** | 5/5 | 1.76 | 263.4s |
+
+

@@ -11,11 +11,23 @@ const { values } = parseArgs({
     tier: { type: "string", default: "smoke" },
     runs: { type: "string", default: "1" },
     task: { type: "string" },
+    timeout: { type: "string" },
+    noTimeout: { type: "boolean" },
+    budget: { type: "string" },
   },
 });
-if (!values.config) { console.error("usage: pnpm bench --config <name> [--tier smoke|core|full] [--runs N] [--task id]"); process.exit(1); }
+if (values.noTimeout) process.env.BENCH_NO_TIMEOUT = "1";
+if (values.timeout) process.env.BENCH_TIMEOUT_SEC = values.timeout;
+if (values.budget) process.env.BENCH_OUTPUT_BUDGET = values.budget;
+if (!values.config) { console.error("usage: pnpm bench --config <name> [--tier smoke|core|full] [--runs N] [--task id] [--noTimeout] [--budget N]"); process.exit(1); }
 
-const tiers = { smoke: ["smoke"], core: ["smoke", "core"], full: ["smoke", "core", "full"] } as const;
+const tiers = {
+  smoke: ["smoke"],
+  core: ["core"],
+  "smoke+core": ["smoke", "core"],
+  full: ["smoke", "core", "full"],
+  all: ["smoke", "core", "full"],
+} as const;
 const allowed = tiers[values.tier as keyof typeof tiers] ?? tiers.smoke;
 const tasksDir = join(BENCH_ROOT, "tasks");
 const tasks: { dir: string; meta: TaskMeta }[] = [];

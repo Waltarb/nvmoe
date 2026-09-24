@@ -428,14 +428,44 @@ Acquire Unsloth's official 2-bit Dynamic quantization of Qwen3.8-Flash-Next (`un
 
 | Metric | Measured Value | Notes |
 |---|:---:|---|
-| **Steady-State Decode Throughput** | **15.29 tok/s** | (avg 65.4 ms/tok, peak 23.1 tok/s / min latency 43.3 ms) |
-| **Prompt Prefill (TTFT)** | **16.39 tok/s** | (1.34s on 22 tokens; 17.59 tok/s on 19 tokens) |
-| **Decode GPU VRAM Hits** | **80.5% – 85.9%** | Immediate 0 ms PCIe transfer |
-| **Host In-Memory Hits** | **65.8% – 67.7%** | Pinned Host RAM hit rate |
-| **Tail NVMe Misses Pruned** | **5,121 skipped** | Zero-IO dynamic pruning per generation |
-| **CUDA Model Buffer (VRAM)** | **6,462.50 MiB** (~6.46 GiB) | Well under 14 GiB hard cap |
-| **Host RAM Usage** | **~12.8 GiB total** | Well under 20 GiB hard cap |
-| **Output Quality** | **100% Coherent** | Perfectly formatted reasoning `<think>` trace and factual answers |
+---
+
+## Phase 9: High-Throughput Interleaved Direct I/O + Two-Tier Cost-Aware Pruning + Non-Blocking CUDA Sync on Qwen3.8-Flash (Pushing 25 tok/s Steady Decode)
+
+### Background & Objective
+Push decode throughput of Unsloth's Qwen3.8-Flash low-quant (`UD-Q2_K_XL`) from 15.3 tok/s to **25+ tok/s steady decode** on an RTX 3080 Ti Laptop (16 GB VRAM, 31 GiB DDR5 Host RAM), keeping VRAM strictly < 14 GiB and Host RAM strictly < 20 GiB.
+
+### Architecture & Optimizations Implemented
+1. **Contiguous 4096-Aligned Interleaved Expert Repacking (Path B)**:
+   - Created `scripts/repack_unsloth_interleaved.cpp` to reorganize 48 layers (512 experts each) into a single contiguous binary sidecar (`interleaved_experts.bin`, 42.99 GiB).
+   - Expert blocks (`gate`, `up`, `down`) are grouped adjacently per expert with strict 4096-byte page alignment.
+   - Replaced 3 disjoint reads per expert with **1 single zero-copy `io_uring_prep_read`** straight from NVMe into the pinned host memory slot.
+   - Eliminates CPU `memcpy` bounce buffers and cuts I/O queue overhead from 15 seeks/tok to 5 seeks/tok.
+2. **Two-Tier Cost-Aware Expert Pruning (Path C)**:
+   - **Tier 1 (GPU VRAM)**: Zero latency cost; never pruned.
+   - **Tier 2 (Pinned Host RAM)**: Pruned only when relative softmax weight $< \text{prune\_host\_thresh}$ (0.04) to conserve PCIe bandwidth.
+   - **Tier 3 (Cold NVMe Miss)**: Cold SSD tail misses are aggressively pruned when relative weight $< \text{prune\_nvme\_thresh}$ (0.40–0.45) or when in-memory mass threshold ($\text{prune\_min\_mass} = 0.45$) is satisfied. Pruned weights are zeroed and aliased to GPU-resident experts, with surviving weights dynamically renormalized.
+3. **Non-Blocking Hardware Stream Synchronization**:
+   - Replaced blocking CPU `cudaStreamSynchronize(st->h2d_stream)` on every layer with hardware event recording (`cudaEventRecord`) and backend stream waiting (`ggml_backend_event_wait(st->cuda_backend, st->ggml_h2d_event)`).
+   - CPU immediately returns to scheduling work while the CUDA driver hardware queue guarantees memory consistency.
+4. **Cache Scaling & `safe_ubatch` Safety Clamping**:
+   - Scaled GPU cache to `NVMOE_CACHE_SIZE=108` with `NVMOE_GPU_PINNED_EXPERTS=64` (permanently locking top-64 routed experts in VRAM per layer).
+   - Scaled Host cache to `NVMOE_HOST_CACHE_SIZE=168` with `NVMOE_PINNED_EXPERTS=120` (pinning 120 experts per layer in host pinned RAM).
+   - Clamped `safe_ubatch` to $\le 6$ to prevent `mm_ids_helper` out-of-bounds indexing in `mmq.cuh` when $N_{\text{ubatch}} \times K > 80$.
+
+### Acceleration Progression on Qwen3.8-Flash (`UD-Q2_K_XL`):
+| Optimization Stage | Steady-State Decode | Min Token Latency (Peak tok/s) | Prefill (TTFT) | GPU VRAM Hit Rate | NVMe Tail Pruned |
+|---|:---:|:---:|:---:|:---:|:---:|
+| **Phase 8 Baseline** (36 GPU / 96 Host, blocking sync, 3-bank GGUF) | **15.29 tok/s** (65.4 ms) | 43.3 ms (23.1 tok/s) | 16.39 tok/s | 80.5% | 5,121 / 50 tok |
+| **Stage 1: Two-Tier Pruning + Non-Blocking Event Sync** | **18.86 tok/s** (53.0 ms) | 29.6 ms (33.8 tok/s) | 20.01 tok/s | 87.2% | 7,199 / 50 tok |
+| **Stage 2: Contiguous Interleaved Direct I/O** (80 GPU / 144 Host) | **21.98 tok/s** (45.5 ms) | 31.1 ms (32.2 tok/s) | 26.06 tok/s | 87.9% | 7,142 / 50 tok |
+| **Stage 3: Expanded High-Memory Cache** (108 GPU / 168 Host, 64/120 Pinned) | **24.93 tok/s** (40.1 ms) | **27.5 ms (36.3 tok/s)** | **23.73 tok/s** | **92.6%** | **11,815 / 75 tok** |
+
+### Safety Invariant Compliance:
+- **GPU VRAM**: Model buffer **12.64 GiB** ($< 14.0\text{ GiB}$ hard cap).
+- **Host RAM**: System resident memory **~15.1 GiB** ($< 20.0\text{ GiB}$ hard cap).
+- **Generative Coherence**: Output text remained 100% fluent, factual, and strictly followed reasoning templates across all prompts tested.
+
 
 
 

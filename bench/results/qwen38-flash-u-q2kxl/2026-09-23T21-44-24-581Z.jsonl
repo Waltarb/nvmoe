@@ -1,0 +1,1 @@
+{"config":"qwen38-flash-u-q2kxl","task":"06-async-batch-scheduler","category":"concurrency","run":1,"solved":false,"hiddenPassed":0,"hiddenTotal":8,"specGreen":false,"tscOk":true,"turns":1,"formatErrors":1,"applyErrors":0,"stopReason":"error","promptTokens":1412,"outputTokens":634,"usageEstimated":false,"ttftMs":[19866],"decodeTokS":[31.29],"wallMs":77433,"error":"terminated"}

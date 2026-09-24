@@ -1,0 +1,1 @@
+{"config":"qwen38-iq2","task":"01-paginate-bugfix","category":"bugfix","run":1,"solved":true,"hiddenPassed":7,"hiddenTotal":7,"specGreen":true,"tscOk":true,"turns":1,"formatErrors":0,"applyErrors":0,"stopReason":"spec_green","promptTokens":663,"outputTokens":575,"usageEstimated":false,"ttftMs":[10670],"decodeTokS":[27.68],"wallMs":31869}

@@ -1,2 +1,4 @@
 node_modules/
 .work/
+.live_stream.txt
+.live_status.json

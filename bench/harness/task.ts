@@ -23,19 +23,30 @@ export interface TaskResult {
 }
 
 const SYSTEM = `You are a senior TypeScript developer working in a small repo.
+Keep any internal reasoning (<think>) concise (under 200 words) and proceed directly to outputting the complete SEARCH/REPLACE code edits.
 Reply ONLY with edit blocks in exactly this format, one block per change:
 
-path/to/file.ts
+Example edit:
+src/math.ts
 <<<<<<< SEARCH
-exact lines from the current file
+export function add(a: number, b: number): number {
+  return 0;
+}
 =======
-replacement lines
+export function add(a: number, b: number): number {
+  return a + b;
+}
 >>>>>>> REPLACE
 
 Rules:
+- Do NOT output conversational chatter or explanations. Start immediately with the file path.
 - SEARCH must match the current file exactly, including whitespace. Keep it short but unique.
-- To create a new file, leave SEARCH empty.
-- No explanations, no full-file rewrites, nothing outside the blocks.
+- To create a new file or replace the entire file, leave SEARCH empty:
+path/to/file.ts
+<<<<<<< SEARCH
+=======
+// replacement content
+>>>>>>> REPLACE
 - Do not edit files under spec/.
 - After your edits the spec tests run automatically and you will see the result.
 - When the task is complete, write DONE on its own line.`;
@@ -83,14 +94,17 @@ export async function runTask(taskDir: string, meta: TaskMeta, config: string, r
   if (approxTokens(SYSTEM + prompt) > 4000) console.warn(`  ! ${meta.id}: prompt ~${approxTokens(SYSTEM + prompt)} tokens, over the 4k budget`);
   const messages: Msg[] = [{ role: "system", content: SYSTEM }, { role: "user", content: prompt }];
   const t0 = performance.now();
-  const deadline = t0 + meta.timeoutSec * 1000;
+  const noTimeout = process.env.BENCH_NO_TIMEOUT === "1" || process.env.BENCH_TIMEOUT_SEC === "0";
+  const timeoutSec = noTimeout ? 0 : (process.env.BENCH_TIMEOUT_SEC ? parseInt(process.env.BENCH_TIMEOUT_SEC, 10) : (meta.timeoutSec || 1800));
+  const deadline = timeoutSec > 0 ? t0 + timeoutSec * 1000 : Infinity;
 
   try {
+    const totalBudget = process.env.BENCH_OUTPUT_BUDGET ? parseInt(process.env.BENCH_OUTPUT_BUDGET, 10) : (meta.outputBudget || 4000);
     for (let turn = 1; turn <= meta.maxTurns; turn++) {
-      const remaining = meta.outputBudget - res.outputTokens;
-      const timeLeft = deadline - performance.now();
+      const remaining = totalBudget - res.outputTokens;
+      const timeLeft = timeoutSec > 0 ? (deadline - performance.now()) : 0;
       if (remaining <= 0) { res.stopReason = "budget"; break; }
-      if (timeLeft <= 0) { res.stopReason = "timeout"; break; }
+      if (timeoutSec > 0 && timeLeft <= 0) { res.stopReason = "timeout"; break; }
 
       let r;
       try { r = await chat(messages, remaining, timeLeft); }
